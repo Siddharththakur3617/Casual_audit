@@ -1,0 +1,82 @@
+# Cart-pole causal-structure study.
+# environment + data: used by data/generate.py
+# model + training:   used by train_cc.py (same keys as JEPA_control/experiments/train.py)
+
+environment:
+  frame_skip: 2          # one transition = 2 Euler sub-steps of 0.02 s
+  dt: 0.02
+  image_size: 128
+  action_range: [-10.0, 10.0]
+  # physics stays at the env defaults: M=1.0, m=0.1, l=0.5, g=9.8, no friction
+
+data:
+  seed: 42
+  # uniform random force each step: keeps u_t and u_{t-1} uncorrelated
+  n_random_episodes: 900
+  random_ep_len: 40
+  random_init_range: 0.2
+  # PRBS, sign flips with probability 0.5 per step
+  n_pe_episodes: 500
+  pe_ep_len: 40
+  pe_init_range: 0.05
+  pe_action_amplitudes: [1.0, 3.0, 6.0]
+  pe_flip_prob: 0.5
+  # passive: u = 0, pole falls on its own
+  n_passive_episodes: 250
+  passive_ep_len: 40
+  passive_init_range: 0.05
+  # broad pole angles, LQR + noise
+  n_angle_episodes: 250
+  angle_ep_len: 20
+  angle_min: 0.1
+  angle_max: 1.0
+  angle_action_noise_std: 1.0
+  # no plain LQR / near-equilibrium episodes
+  n_lqr_episodes: 0
+  n_equilibrium: 0
+  max_abs_x: 2.2
+  max_abs_theta: 1.2
+
+model:
+  action_context_dim: 2      # [u_{t-1}, u_t]
+  use_action_history: true
+  history_size: 5            # predictor sees z_{t-4..t}
+  image_size: 128
+  patch_size: 8
+  latent_dim: 192
+  use_frame_diff: true
+  use_proprio: false         # pixels only
+  vit_depth: 4
+  vit_embed_dim: 192
+  vit_heads: 3
+  predictor_depth: 6
+  predictor_dim_head: 64
+  predictor_dropout: 0.1
+  predictor_heads: 16
+  predictor_hidden_dim: 192
+  predictor_mlp_dim: 2048
+  use_inverse_model: true
+  inverse_hidden_dim: 256
+  inverse_seq_len: 4         # last history latent + 3 rollout latents
+
+training:
+  history: 5                 # encoded latents given to the predictor
+  rollout_steps: 3
+  horizon: 7                 # loader window in transitions = history - 1 + rollout_steps
+  batch_size: 64
+  epochs: 200
+  lr: 0.0001
+  min_lr: 1.0e-06
+  warmup_epochs: 5
+  weight_decay: 0.001
+  normalize_actions: true
+  lambda_fwd: 0.0
+  lambda_inverse: 1.0
+  lambda_rollout: 1.0
+  lambda_sigreg: 1.0
+  sigreg_num_points: 17
+  sigreg_num_slices: 128
+  sigreg_variance_floor_weight: 0.0
+  num_workers: 0
+  checkpoint_every: 10
+  probe_every: 10

@@ -1,0 +1,10 @@
+# PyTorch with CUDA 12.8 (needed for the RTX 5090 / Blackwell)
+--extra-index-url https://download.pytorch.org/whl/cu128
+torch==2.11.0+cu128
+numpy>=1.26
+scipy>=1.11
+h5py>=3.10
+PyYAML>=6.0
+scikit-learn>=1.4
+matplotlib>=3.8
+sympy>=1.12

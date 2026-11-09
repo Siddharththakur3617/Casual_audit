@@ -9,8 +9,23 @@ from sklearn.metrics import average_precision_score, roc_auc_score
 from cc_common import INPUT_NAMES, RESULTS, TARGET_NAMES
 
 
-def load_expert():
-    e = json.loads((RESULTS / 'expert_graph_final.json').read_text())
+def expert_path(data_dir=None):
+    """results/expert_graph_final_<dataset>.json for a dataset that has its own expert graph
+    (e.g. cc_phys, from checks/verify_equations.py --vary-physics); the fixed-physics graph otherwise."""
+    from pathlib import Path
+    name = Path(data_dir).name if data_dir else 'cc'
+    name = name[:-len('_small')] if name.endswith('_small') else name
+    if name == 'cc':
+        return RESULTS / 'expert_graph_final.json'
+    p = RESULTS / f'expert_graph_final_{name}.json'
+    if not p.exists():
+        raise FileNotFoundError(f'{p} is missing: run checks/verify_equations.py'
+                                + (' --vary-physics' if 'phys' in name else '') + ' first')
+    return p
+
+
+def load_expert(data_dir=None):
+    e = json.loads(expert_path(data_dir).read_text())
     return np.array(e['adjacency']), np.array(e['tiers'], dtype=object), np.array(e['effect_size'])
 
 
@@ -47,6 +62,64 @@ def vs_expert(kept, weight, A, tiers):
     }
 
 
+def vs_expert_testable(kept, weight, A, tiers, testable):
+    """Same as vs_expert's strong-graph scores, but only over edges into testable targets.
+    testable: (n_targets,) bool. Edges into untestable targets are dropped, not counted as misses."""
+    cols = np.asarray(testable, dtype=bool)
+    kept, w = np.asarray(kept).astype(bool), np.asarray(weight)
+    sel = ((tiers == 'strong') | (tiers == 'absent')) & cols[None, :]
+    ys = (tiers == 'strong')[sel]
+    res = {'testable_targets': [t for t, c in zip(TARGET_NAMES, cols) if c],
+           'n_pos': int(ys.sum()), 'n_neg': int((~ys).sum())}
+    if not sel.any():
+        return {**res, 'f1': float('nan'), 'auroc': float('nan')}
+    return {**res, **_prf(ys, kept[sel]), **_auc(ys, w[sel])}
+
+
+def emergence(epochs, kept_series):
+    """kept_series: (n_epochs, n_in, n_tg) 0/1. Emergence epoch of an edge = the first checkpoint
+    from which it is kept at every later checkpoint; None if it is not kept at the last one."""
+    K = np.asarray(kept_series).astype(bool)
+    out = np.full(K.shape[1:], None, dtype=object)
+    for i, j in np.ndindex(*K.shape[1:]):
+        col = K[:, i, j]
+        if not col[-1]:
+            continue
+        k = len(col) - 1
+        while k > 0 and col[k - 1]:
+            k -= 1
+        out[i, j] = int(epochs[k])
+    return out
+
+
+def summary(res):
+    """Markdown summary table for one checkpoint (differential readout)."""
+    rows = ['| metric | value |', '|---|---|']
+
+    def row(name, f):
+        try:
+            v = f(res)
+        except (KeyError, TypeError):
+            v = '–'
+        rows.append(f'| {name} | {v:.3f} |' if isinstance(v, float) else f'| {name} | {v} |')
+
+    for g in ('predictor', 'encoder'):
+        row(f'{g} strong F1', lambda r, g=g: r['vs_expert'][g]['strong_graph']['f1'])
+        row(f'{g} strong AUROC', lambda r, g=g: r['vs_expert'][g]['strong_graph']['auroc'])
+        row(f'{g} full AUROC', lambda r, g=g: r['vs_expert'][g]['full_graph']['auroc'])
+        row(f'{g} kept / false pos.', lambda r, g=g: f"{int(np.sum(r['graphs'][g]['kept']))} / "
+                                                     f"{len(r['vs_expert'][g]['absent_edges_wrongly_kept'])}")
+        row(f'{g} strong F1 (testable only)', lambda r, g=g: r['vs_expert_testable'][g]['f1'])
+    row('Spearman data vs predictor', lambda r: r['attribution']['data_vs_predictor']['weight_spearman'])
+    row('Spearman encoder vs predictor', lambda r: r['attribution']['encoder_vs_predictor']['weight_spearman'])
+    for j, t in enumerate(TARGET_NAMES):
+        row(f'change R² {t} (enc / pred)',
+            lambda r, j=j: f"{r['probe']['R2_change_encoder_vs_true'][j]:.2f} / "
+                           f"{r['probe']['R2_change_predictor_vs_true'][j]:.2f}")
+    row('missed strong edges (predictor)', lambda r: ', '.join(r['vs_expert']['predictor']['strong_edges_missed']) or '–')
+    return '\n'.join(rows) + '\n'
+
+
 def between(g1, g2):
     """Disagreement between two learned graphs."""
     k1, k2 = np.asarray(g1['kept']).astype(bool), np.asarray(g2['kept']).astype(bool)
@@ -59,7 +132,7 @@ def between(g1, g2):
     }
 
 
-def edge_table(graphs, A, tiers, effect):
+def edge_table(graphs, A, tiers, effect, rule='margin'):
     """Markdown per-edge table: tier, expert effect size, and weight/stability/kept per graph."""
     names = list(graphs)
     head = '| edge | tier | expert effect | ' + ' | '.join(f'{n} weight (stab.)' for n in names) + ' |'
@@ -74,7 +147,9 @@ def edge_table(graphs, A, tiers, effect):
             cells.append(f'{mark}{g["weight"][i][j]:.3f}{mark} ({g["stability"][i][j]:.2f})')
         rows.append(f'| {INPUT_NAMES[i]}→{TARGET_NAMES[j]} | {tiers[i, j]} | {effect[i, j]:.3f} | '
                     + ' | '.join(cells) + ' |')
-    return '\n'.join(rows) + '\n\nBold = kept after pruning. Weight = drop in held-out R² when the input is permuted.'
+    return ('\n'.join(rows) + f'\n\nBold = kept after pruning (rule "{rule}", discovery/prune.py). '
+            'Weight = LOCO log(held-out MSE without the input / with all inputs). Stab. = fraction of '
+            'splits beating the strongest decoy by log 1.5 (the original rule).')
 
 
 def heatmaps(graphs, A, tiers, path):

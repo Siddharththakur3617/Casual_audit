@@ -60,23 +60,29 @@ class Renderer:
 
 
 class CartPole:
-    """reset / step interface. State s = (x, x_dot, theta, theta_dot)."""
+    """reset / step interface. State s = (x, x_dot, theta, theta_dot).
+
+    phys = dict(M, m, l, g) sets the physics (default cc_common.PHYS). It can be changed per
+    episode with reset_to_state(state, phys); the pole is drawn with its true length 2l."""
 
     def __init__(self, image_size=128, frame_skip=FRAME_SKIP, action_range=(-10.0, 10.0),
-                 theta_threshold=1.2, render=True, seed=None):
+                 theta_threshold=1.2, render=True, seed=None, phys=None):
         self.frame_skip = frame_skip
         self.low, self.high = action_range
         self.theta_threshold = theta_threshold
         self.render = Renderer(image_size) if render else None
         self.rng = np.random.RandomState(seed)
+        self.phys = dict(PHYS if phys is None else phys)
         self.state = None
 
     def obs(self):
         if self.render is None:
             return np.zeros((1, 1, 3), np.uint8)
-        return self.render(self.state[0], self.state[2])
+        return self.render(self.state[0], self.state[2], pole_half_length=self.phys['l'])
 
-    def reset_to_state(self, state):
+    def reset_to_state(self, state, phys=None):
+        if phys is not None:
+            self.phys = dict(phys)
         self.state = np.asarray(state, np.float64).copy()
         return self.obs(), self.state.astype(np.float32)
 
@@ -85,7 +91,7 @@ class CartPole:
 
     def step(self, u):
         u = float(np.clip(u, self.low, self.high))
-        self.state = macro_step(self.state, u, n=self.frame_skip, h=H, **PHYS)
+        self.state = macro_step(self.state, u, n=self.frame_skip, h=H, **self.phys)
         x, th = self.state[0], self.state[2]
         done = bool(abs(x) > X_THRESHOLD or abs(th) > self.theta_threshold)
         return self.obs(), self.state.astype(np.float32), done

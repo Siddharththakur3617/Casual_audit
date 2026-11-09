@@ -105,12 +105,22 @@ def stack_episodes(episodes, t_min=T_MIN):
     return out
 
 
-def load_split_episodes(data_dir, split='train'):
-    """Read per-episode HDF5 (DiscreteHDF5TrajectoryDataset format), states and actions only."""
+PHYS_KEYS = ('M', 'm', 'l', 'g')
+
+
+def episode_physics(attrs):
+    """An episode's physics dict from its HDF5 attrs phys_*, falling back to PHYS (fixed-physics data)."""
+    return {k: float(attrs.get(f'phys_{k}', PHYS[k])) for k in PHYS_KEYS}
+
+
+def load_split_episodes(data_dir, split='train', with_physics=False):
+    """Read per-episode HDF5 (DiscreteHDF5TrajectoryDataset format): (states, actions) per episode,
+    or (states, actions, physics dict) with with_physics=True."""
     import h5py
     eps = []
     with h5py.File(Path(data_dir) / f'{split}.hdf5', 'r') as f:
         grp = f['episodes']
         for key in sorted(grp.keys(), key=int):
-            eps.append((grp[key]['states'][:], grp[key]['actions'][:].reshape(-1)))
+            ep = (grp[key]['states'][:], grp[key]['actions'][:].reshape(-1))
+            eps.append(ep + (episode_physics(grp[key].attrs),) if with_physics else ep)
     return eps

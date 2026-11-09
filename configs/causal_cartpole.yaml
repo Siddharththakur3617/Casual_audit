@@ -8,6 +8,14 @@ environment:
   image_size: 128
   action_range: [-10.0, 10.0]
   # physics stays at the env defaults: M=1.0, m=0.1, l=0.5, g=9.8, no friction
+  # (datasets/cc). With generate.py --vary-physics (datasets/cc_phys) every episode draws its
+  # own physics uniformly from these ranges, constant within the episode:
+physics_ranges:
+  M: [0.5, 2.0]      # cart mass (kg), default 1.0
+  m: [0.05, 0.5]     # pole mass (kg), default 0.1
+  l: [0.25, 0.75]    # pole HALF-length (m), default 0.5 -> pole 0.5 .. 1.5 m, drawn at its true length
+  g: [4.9, 14.7]     # gravity (m/s^2), default 9.8 (0.5x .. 1.5x)
+  seed: 4242         # separate stream, so the physics draws do not shift the action/initial-state draws
 
 data:
   seed: 42

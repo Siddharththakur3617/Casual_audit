@@ -2,16 +2,36 @@
 
 How much of cart-pole's causal structure has a pixels-only JEPA world model learned?
 
-Method:
-1. A linear probe reads the state d = (x, v̄, θ, ω̄) from a single latent z_t.
-2. The model's predicted change is Δd̂ = P(ẑ_{t+1}) − P(z_t), where ẑ_{t+1} comes from the predictor (5-latent history).
-3. Every edge from [x, v̄, θ, ω̄, u_t, u_{t−1}, u_{t−2}] to [Δx, Δv̄, Δθ, Δω̄] is scored, pruned, and compared with an expert graph derived from the equations.
+Method (current, 2026-11-10):
+1. **Data: `datasets/cc_phys`.** Every episode has its own cart mass, pole mass, pole length and gravity (see below). The physics varies only in the background: the causal graph is still the 28 edges [x, v̄, θ, ω̄, u_t, u_{t−1}, u_{t−2}] → [Δx, Δv̄, Δθ, Δω̄], because within an episode the physics does not change.
+2. **Readout.** The **differential probe** Q_D (MLP 192 → 256 → 256 → 4) reads the change Δd from a latent change. It is fitted on the encoder's change z_{t+1} − z_t and then reads the predictor's change ẑ_{t+1} − z_t (5-latent history). It is the only readout: the normal and hybrid arms were removed on 2026-11-09 (old code in `_archive/2026-11-09_three_arms_and_old_pruning/`).
+3. **Edges.** Every edge from the true inputs to the read-out change is scored with LOCO over 50 episode half-splits and pruned with a rule from `discovery/prune.py` (`--prune`). The result is compared with the expert graph for the dataset: `results/expert_graph_final_cc_phys.json` for cc_phys, from `checks/verify_equations.py --vary-physics`, where each transition is differentiated at its own physics.
+4. **Rule choice.** `compare_pruning.py` compares the pruning rules on the same scores (see "Pruning rules" below).
 
-The plan is at `C:\Users\Administrator\.claude\plans\ok-then-plan-this-enchanted-cookie.md`. This folder imports `JEPA_control` but does not modify it.
+### Current run order (PowerShell, from this folder)
+```powershell
+$PY = ".\.venv\Scripts\python.exe"; $env:PYTHONUTF8 = "1"
+& $PY checks\verify_equations.py --vary-physics                                    # ~5 min CPU -> expert graph for cc_phys
+& $PY compare_pruning.py --data datasets/cc_phys --run-dir runs/jepa_cc            # ~1-1.5 h GPU -> pick a rule
+# optional: a JEPA trained on varied physics (~3.5 h GPU; resume with --resume <checkpoint>)
+& $PY train_cc.py --data datasets/cc_phys --save-dir runs/jepa_cc_phys
+& $PY run_all.py --data datasets/cc_phys --ckpt <run>/checkpoints/checkpoint_epoch0200.pt --prune <rule>
+& $PY run_all.py --data datasets/cc_phys --run-dir <run> --curve --splits 20 --prune <rule>
+```
+Outputs:
+- `results/checks_cc_phys.json` and `results/expert_graph_final_cc_phys.json`
+- `results/pruning_comparison_cc_phys_<run>/report.md`
+- `results/<run>_cc_phys_diff_<rule>/…` and `results/data_baseline_cc_phys_<rule>.json`
 
-## Run order
+Two consequences of hidden physics:
+- **Imperfect baseline.** Even the true-data baseline can no longer reach R² = 1, so its recovery of the expert graph is no longer guaranteed.
+- **Old model is out-of-distribution.** `runs/jepa_cc` was trained on fixed physics, so on cc_phys it is out-of-distribution.
 
-Use the repo's virtual env: `PY=../Evaluating-Causal-Metrics-on-World-Models/JEPA_control/.venv/Scripts/python.exe`. Set `PYTHONUTF8=1` on Windows, because the repo prints Unicode arrows.
+The plan is at `C:\Users\Administrator\.claude\plans\firstly-update-everything-according-humble-wombat.md`. This folder imports `JEPA_control` but does not modify it.
+
+## Original fixed-physics study (`datasets/cc`, `runs/jepa_cc`)
+
+Every command still works on `datasets/cc` and uses `results/expert_graph_final.json`. Use the repo's virtual env: `PY=../Evaluating-Causal-Metrics-on-World-Models/JEPA_control/.venv/Scripts/python.exe`. Set `PYTHONUTF8=1` on Windows, because the repo prints Unicode arrows.
 
 | step | command | time |
 |---|---|---|
@@ -27,6 +47,84 @@ Outputs:
 - `results/data_baseline.json`
 - `results/jepa_cc/epoch####/{results.json, edges.md, graphs.png}`
 - `results/jepa_cc/curve.{json,png}`
+
+## Varied-physics dataset `datasets/cc_phys` (2026-11-09)
+
+`python datagen/generate.py --vary-physics` draws each episode's physics uniformly from `physics_ranges` in the config. The physics is constant within an episode.
+
+| parameter | range | old fixed value |
+|---|---|---|
+| cart mass M | 0.5 – 2.0 kg | 1.0 |
+| pole mass m | 0.05 – 0.5 kg | 0.1 |
+| pole half-length l | 0.25 – 0.75 m (pole 0.5 – 1.5 m, drawn at its true length) | 0.5 |
+| gravity g | 4.9 – 14.7 m/s² | 9.8 |
+
+Same episode types, counts and seeds as `datasets/cc`. The LQR gain is recomputed per episode. Each episode stores `phys_M, phys_m, phys_l, phys_g` as HDF5 attrs, and `probing/extract.py` returns them per transition as `physics` (n, 4). Without the flag the generator reproduces `datasets/cc` exactly, which was verified on `cc_small`.
+
+The JEPA (`runs/jepa_cc`) was trained on fixed physics only, so on `cc_phys` it sees unfamiliar dynamics and pole lengths. The probe report includes change R² per third of each parameter's range (`R2_by_physics_tercile`).
+```powershell
+& $PY run_all.py --data datasets/cc_phys --ckpt runs/jepa_cc/checkpoints/checkpoint_epoch0200.pt --probe-only --seeds 3
+```
+Output: `results/jepa_cc_cc_phys_diff_margin/epoch0200/probe.json`.
+
+`checks/verify_equations.py --vary-physics` runs the same six checks under the cc_phys policies:
+- **(a), (b)** Equations and energy are tested at random physics.
+- **(c)** The observability bar is R² > 0.99, because one linear fit cannot absorb a 1/(M+m) acceleration.
+- **(d), (e)** Every sampled transition is differentiated at its own episode's physics. The tiers are recomputed over that distribution, and the changes against the fixed-physics graph are listed.
+- **(f)** The Markov check passes when older history adds nothing once the physics is known. It also reports, as a diagnostic, how much older history helps when the physics is hidden. That is the information a 5-latent history could use to infer the physics.
+
+## Differential probe only, and new pruning rules (2026-11-09)
+
+The same commands work for either dataset (see "Current run order" above). `compare_pruning.py` writes to `results/pruning_comparison_<data>_<run>/`. It takes the data_noisy noise level from the studied model's own predictor change R² at its last checkpoint, and compares the model's last checkpoint with epoch 0.
+
+Pruning rules (`discovery/prune.py`; all read the same per-split scores, all blind to the expert graph):
+
+| rule | keeps an edge if | source |
+|---|---|---|
+| margin (original) | LOCO beats the strongest shuffled decoy by log 1.5 in ≥ 70% of splits | Meinshausen & Bühlmann 2010; Barber & Candès 2015 |
+| fdr | per-split episode-clustered z-test of LOCO vs the strongest decoy; p-values combined across splits (2 × median); BH at q = 0.05 | Lei et al. 2018; Williamson et al. 2023; Meinshausen, Meier & Bühlmann 2009 |
+| min_effect | as fdr, but H0 is "explains ≤ 1% more target variance than a decoy" | minimum-relevant-effect test |
+| effect | normalised Jacobian of the full fit ≥ 0.1 (the expert's own "strong" unit and cut-off) and above every decoy's, in ≥ 70% of splits | expert tier rule (check e) |
+| effect_fdr | effect AND fdr | — |
+| knockoff | derandomised Gaussian model-X knockoffs, knockoff+ (q = 0.1), selected in ≥ 50% of splits | Candès et al. 2018; Ren, Wei & Candès 2023 |
+
+Why the rule matters here: θ and ω̄ are 98–99% predictable from the other inputs (even with open-loop forcing), so LOCO's unique information for edges out of θ and ω̄ is under 1% of target variance. The original log-ratio margin passes them on noise-free data only because the residual there is ~0. At the model's noise floor (held-out R² 0.93–0.98) the same edges fall below the margin.
+
+## Earlier design: three readout arms (2026-11-07, superseded)
+
+The question is whether, and how, the JEPA learns cart-pole's causal structure **during training**. The model's predicted change is read in three separate ways. Each arm trains its own MLP probe(s) (192 → 256 → 256 → out, SiLU, 40 epochs), only on **encoder** latents, cross-fitted by episode with the same 5 folds for every arm. The frozen probes then read the **predictor's** output. Each arm's results are reported separately: there is no primary arm and no cross-arm vote.
+
+| arm | probe(s) | predictor change Δd̂ |
+|---|---|---|
+| normal | S_N: z → (x, v̄, θ, ω̄) | S_N(ẑ_{t+1}) − S_N(z_t) |
+| differential | Q_D: z_{t+1} − z_t → Δd | Q_D(ẑ_{t+1} − z_t) |
+| hybrid | H_L: z → (v̄, ω̄); H_D: Δz → (Δv̄, Δω̄) | Δx = DT·v̄(ẑ_{t+1}), Δθ = DT·ω̄(ẑ_{t+1}); Δv̄, Δω̄ = H_D(ẑ_{t+1} − z_t) |
+
+- The hybrid's kinematic rows are exact: v̄_{t+1} = (x_{t+1} − x_t)/DT, so Δx = DT·v̄_{t+1}. This was checked on the data (max error 1.5e-8).
+- The edge-scoring inputs are the **true** simulator states plus u_t, u_{t−1}, u_{t−2} for every arm and checkpoint, so only the readout of the model's change varies. `--inputs linear` gives the old linear-probed inputs as a continuity row.
+- Scoring, pruning (log 1.5 margin, 70% stability) and the expert comparison are unchanged.
+- Action effects are a finite difference of each arm's own readout along d ẑ / d u.
+
+Criteria fixed in advance:
+- **Testable target:** encoder-change R² ≥ 0.5. Edges into untestable targets are untestable, not absent. F1 is also reported on testable edges only.
+- **Learned (per arm):** the epoch-200 predictor strong-graph AUROC is above that arm's epoch-0 floor, with no false-positive edges.
+- **Emergence epoch of an edge:** the first checkpoint from which it is kept at every later checkpoint.
+
+Run order (PowerShell, from this folder):
+```powershell
+$PY = ".\.venv\Scripts\python.exe"; $env:PYTHONUTF8 = "1"
+$env:CUDA_VISIBLE_DEVICES = "-1"     # CPU while the GPU is unstable; never set it to ""
+& $PY run_all.py --data datasets/cc --ckpt runs/jepa_cc/checkpoints/checkpoint_epoch0200.pt --probe-only --seeds 3
+& $PY run_all.py --data datasets/cc --ckpt runs/jepa_cc/checkpoints/checkpoint_epoch0000.pt --probe-only --seeds 3
+& $PY run_all.py --data datasets/cc --ckpt runs/jepa_cc/checkpoints/checkpoint_epoch0200.pt
+& $PY run_all.py --data datasets/cc --ckpt runs/jepa_cc/checkpoints/checkpoint_epoch0000.pt
+& $PY run_all.py --data datasets/cc --run-dir runs/jepa_cc --curve --splits 20     # stable GPU only
+```
+Outputs:
+- `results/jepa_cc_arms/epoch####/<arm>/{results.json, edges.md, graphs.png, probe.json}` and `epoch####/summary.md`
+- curve: `results/jepa_cc_arms/curve_s20/…`, `curve_<arm>.json` (including emergence epochs) and `curve.png`
+
+Every run is **resumable**. Extractions are cached in `runs/jepa_cc/extract/` (about 100 MB each), and a finished (checkpoint, arm) pair is skipped. After a GPU loss, kill the frozen Python process, reboot and rerun the same command. The old linear readouts are still available with `--readout state|delta`.
 
 ## Changes from the plan made during implementation
 

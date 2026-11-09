@@ -1,4 +1,4 @@
-"""Step 5: edge weights for one graph (inputs X -> targets Y).
+"""Step 5: edge scores for one graph (inputs X -> targets Y).
 
 Primary weight: leave-one-covariate-out (LOCO; Lei et al. 2018). For each
 target j, fit a small MLP on all inputs, and one more MLP per input i with that
@@ -9,12 +9,21 @@ cause (e.g. vbar -> dtheta via its correlation with wbar).
 
 All variants of one split are trained together as one batched network, from the
 same initial weights (common random numbers), so their differences are not
-dominated by initialisation noise.
+dominated by initialisation noise. Repeated over random half-splits by episode
+(fit on one half, score on the other).
 
-Two decoy inputs (shuffled copies of u_t and theta) are added every time; their
-LOCO weight is the "no effect" level. Repeated over random half-splits by
-episode (fit on one half, score on the other). Stability = fraction of splits in
-which an edge beats the strongest decoy for that target (used by prune.py).
+Negative controls ("decoys"), two kinds:
+  decoys='shuffled'  shuffled copies of u_t and theta (independent of everything).
+  decoys='knockoff'  Gaussian model-X knockoffs of all 7 inputs, drawn fresh for every split
+                     (Candes et al. 2018). A knockoff copies the input's correlation with the
+                     other inputs but carries no information about Y beyond them.
+
+Everything the pruning rules in prune.py need is kept per split (scores['per_split']):
+  L     log MSE ratio (LOCO weight)                          (splits, n_cols, n_tg)
+  D     MSE increase in units of target variance (R2 drop)   (splits, n_cols, n_tg)
+  Dvs   D(edge) - D(strongest decoy), and its episode-clustered standard error
+  J     normalised Jacobian effect of the full fit, mean |df/dx_i| * sd(x_i) / sd(y), i.e.
+        the same unit as the expert effect sizes (checks/verify_equations.py, check e)
 
 Cross-check: group-lasso component-wise MLP (neural Granger causality,
 Tank et al. 2021); weight = L2 norm of the input's first-layer column.
@@ -27,10 +36,9 @@ import torch.nn as nn
 from scipy.stats import spearmanr
 
 DECOYS = ['decoy_u_t', 'decoy_theta']
-DECOY_SOURCE = [4, 2]        # columns of X that the decoys are shuffled copies of
-# An edge must raise held-out error at least 50% more than removing a decoy does.
-# Fixed in advance (not tuned on the expert graph). Needed because inputs that are
-# correlated with a real cause sit slightly above independent decoys.
+DECOY_SOURCE = [4, 2]        # columns of X that the shuffled decoys are copies of
+# Margin of the original pruning rule (prune.rule_margin): an edge must raise held-out error at
+# least 50% more than removing a decoy does. Fixed in advance (not tuned on the expert graph).
 MARGIN = float(np.log(1.5))
 
 
@@ -95,8 +103,58 @@ def with_decoys(X, rng):
     return np.column_stack([X] + [X[rng.permutation(len(X)), c] for c in DECOY_SOURCE])
 
 
-def loco_split(Xa, Ya, Xb, Yb, seed, device, steps):
-    """One split: held-out MSE of the full model and of each drop-one model."""
+# ---------------------------------------------------------------------------
+# Gaussian model-X knockoffs (second-order; Candes, Fan, Janson & Lv 2018)
+# ---------------------------------------------------------------------------
+
+def knockoff_s(Sigma):
+    """SDP knockoff parameters: maximise sum(s) s.t. 2*Sigma - diag(s) >= 0, 0 <= s <= 1
+    (Sigma is a correlation matrix). Small p, so SLSQP on the smallest eigenvalue is enough."""
+    from scipy.optimize import minimize
+    p = len(Sigma)
+    lam_min = float(np.linalg.eigvalsh(Sigma).min())
+    s0 = np.full(p, min(1.0, 2 * lam_min) * 0.99)                  # equicorrelated start (feasible)
+    cons = {'type': 'ineq', 'fun': lambda s: np.linalg.eigvalsh(2 * Sigma - np.diag(s)).min() - 1e-6}
+    res = minimize(lambda s: -s.sum(), s0, bounds=[(0, 1)] * p, constraints=[cons], method='SLSQP',
+                   options={'maxiter': 500, 'ftol': 1e-10})
+    s = res.x if res.success and cons['fun'](res.x) >= -1e-9 else s0
+    return np.clip(s, 0, 1)
+
+
+class GaussianKnockoffs:
+    def __init__(self, X):
+        self.m, self.sd = X.mean(0), X.std(0) + 1e-12
+        Z = (X - self.m) / self.sd
+        self.Sigma = np.corrcoef(Z, rowvar=False)
+        self.s = knockoff_s(self.Sigma)
+        D = np.diag(self.s)
+        Si = np.linalg.inv(self.Sigma)
+        self.A = np.eye(len(D)) - Si @ D                             # E[Xk | X] = Z A
+        V = 2 * D - D @ Si @ D
+        w, U = np.linalg.eigh((V + V.T) / 2)
+        self.Lc = U * np.sqrt(np.clip(w, 0, None))                   # V = Lc Lc^T
+
+    def sample(self, X, rng):
+        Z = (X - self.m) / self.sd
+        Zk = Z @ self.A + rng.standard_normal(Z.shape) @ self.Lc.T
+        return Zk * self.sd + self.m
+
+
+# ---------------------------------------------------------------------------
+
+def _cluster_mean_se(a, n_e):
+    """a: (E, ...) per-episode sums, n_e: (E,) counts. Ratio-estimator mean and its
+    episode-clustered standard error."""
+    N = n_e.sum()
+    theta = a.sum(0) / N
+    r = a - theta[None] * n_e.reshape(-1, *([1] * (a.ndim - 1)))
+    E = len(n_e)
+    return theta, np.sqrt(E / (E - 1) * (r ** 2).sum(0)) / N
+
+
+def loco_split(Xa, Ya, Xb, Yb, ep_b, seed, device, steps, n_dec):
+    """One split. Returns per-split arrays (see module docstring). The last n_dec columns of X are
+    decoys/knockoffs."""
     n_in, n_tg = Xa.shape[1], Ya.shape[1]
     n_var = n_in + 1                                       # variant 0 = all inputs
     mask = torch.ones(n_var, n_in)
@@ -108,43 +166,75 @@ def loco_split(Xa, Ya, Xb, Yb, seed, device, steps):
     net.tie_init(n_tg)
     T = lambda v: torch.as_tensor(v, dtype=torch.float32, device=device)  # noqa: E731
     train(net, T(Xa), T(Ya).repeat(1, n_var), steps=steps)
+    xb = T(Xb).requires_grad_(True)
+    out = net(xb)
+    J = np.zeros((n_in, n_tg))
+    for j in range(n_tg):                                   # networks 0..n_tg-1 = full model
+        g, = torch.autograd.grad(out[:, j].sum(), xb, retain_graph=j < n_tg - 1)
+        J[:, j] = g.abs().mean(0).detach().cpu().numpy()
     with torch.no_grad():
-        err = ((net(T(Xb)) - T(Yb).repeat(1, n_var)) ** 2).mean(0).reshape(n_var, n_tg)
-    err = err.cpu().numpy()
-    return err[0], err[1:]                                  # (n_tg,), (n_in, n_tg)
+        se = ((out.detach() - T(Yb).repeat(1, n_var)) ** 2).reshape(len(Xb), n_var, n_tg).cpu().numpy()
+    vy = Yb.var(0)
+    full, drop = se[:, 0].mean(0), se[:, 1:].mean(0)        # (n_tg,), (n_in, n_tg)
+    L = np.log(drop / full[None])
+    D = (drop - full[None]) / vy[None]
+    # strongest decoy per target, and the edge-minus-decoy contrast with an episode-clustered SE
+    dmax = np.argmax(L[n_in - n_dec:], axis=0) + n_in - n_dec   # (n_tg,)
+    inc = (se[:, 1:] - se[:, :1]) / vy[None, None]          # (n, n_in, n_tg) per-sample increase
+    contrast = inc - inc[:, dmax, np.arange(n_tg)][:, None, :]
+    eps_u, inv = np.unique(ep_b, return_inverse=True)
+    a = np.zeros((len(eps_u), n_in, n_tg))
+    np.add.at(a, inv, contrast)
+    Dvs, Dvs_se = _cluster_mean_se(a, np.bincount(inv).astype(float))
+    return {'L': L, 'D': D, 'Dvs': Dvs, 'Dvs_se': Dvs_se, 'J': J, 'R2': 1 - full / vy}
 
 
-def score_graph(X, Y, episode, n_splits=50, seed=0, device='cuda', steps=1500, verbose=False):
-    """Returns LOCO weights (n_in, n_tg), decoy weights, stability, held-out R2."""
+def score_graph(X, Y, episode, n_splits=50, seed=0, device='cuda', steps=1500, decoys='shuffled',
+                verbose=False):
+    """Scores for every edge (inputs X -> targets Y). Returns summary arrays plus 'per_split'.
+
+    decoys='shuffled' reproduces the original scores exactly (same random stream)."""
     device = device if torch.cuda.is_available() else 'cpu'
     rng = np.random.default_rng(seed)
     n_in, n_tg = X.shape[1], Y.shape[1]
-    L = np.zeros((n_splits, n_in + len(DECOYS), n_tg))     # log MSE ratio
-    D = np.zeros_like(L)                                    # MSE increase (= R2 drop, standardised)
-    R2 = np.zeros((n_splits, n_tg))
+    if decoys == 'shuffled':
+        n_dec, ko = len(DECOYS), None
+    elif decoys == 'knockoff':
+        n_dec, ko = n_in, GaussianKnockoffs(X)
+    else:
+        raise ValueError(decoys)
+    keys = ('L', 'D', 'Dvs', 'Dvs_se', 'J', 'R2')
+    per = {k: [] for k in keys}
     for s in range(n_splits):
-        Xd = with_decoys(X, rng)
+        Xd = with_decoys(X, rng) if ko is None else np.column_stack([X, ko.sample(X, rng)])
         a, b = half_split(episode, rng)
         Xa, Xb = standardise(Xd[a], Xd[b])
         Ya, Yb = standardise(Y[a], Y[b])
-        full, drop = loco_split(Xa, Ya, Xb, Yb, seed * 1000 + s, device, steps)
-        L[s] = np.log(drop / full[None])
-        D[s] = drop - full[None]
-        R2[s] = 1 - full / Yb.var(0)
+        r = loco_split(Xa, Ya, Xb, Yb, episode[b], seed * 1000 + s, device, steps, n_dec)
+        for k in keys:
+            per[k].append(r[k])
         if verbose and (s + 1) % 10 == 0:
-            print(f'    split {s + 1}/{n_splits}  held-out R2={np.round(R2[:s + 1].mean(0), 4)}')
+            print(f'    split {s + 1}/{n_splits}  held-out R2={np.round(np.mean(per["R2"], 0), 4)}', flush=True)
+    per = {k: np.asarray(v) for k, v in per.items()}
+    L = per['L']
     decoy_max = L[:, n_in:, :].max(1)                       # (splits, n_tg)
-    beats = L[:, :n_in, :] > decoy_max[:, None, :] + MARGIN
-    return {
+    out = {
+        'decoys': decoys,
         'weight': L[:, :n_in, :].mean(0),
         'weight_sd': L[:, :n_in, :].std(0),
-        'weight_r2_drop': D[:, :n_in, :].mean(0),
+        'weight_r2_drop': per['D'][:, :n_in, :].mean(0),
         'decoy_weight': L[:, n_in:, :].mean(0),
         'decoy_max_mean': decoy_max.mean(0),
-        'stability': beats.mean(0),
-        'heldout_R2': R2.mean(0),
+        'jacobian_effect': per['J'][:, :n_in, :].mean(0),
+        'heldout_R2': per['R2'].mean(0),
         'n_splits': n_splits,
+        'per_split': per,
     }
+    if decoys == 'shuffled':                                 # the original rule's stability
+        out['stability'] = (L[:, :n_in, :] > decoy_max[:, None, :] + MARGIN).mean(0)
+    else:
+        out['knockoff_s'] = ko.s
+    return out
 
 
 def group_lasso_weights(X, Y, episode, lams=(0.0, 1e-3, 3e-3, 1e-2, 3e-2, 1e-1), tol=0.01,

@@ -11,9 +11,15 @@ passes |theta| > 1.2, so every stored transition is complete and visible.
 Output (per split): episodes/<i>/{observations (T+1,h,w,3) uint8, states (T+1,4),
 actions (T,1)}, attrs trajectory_type; plus metadata.json and summary.json.
 
+Physics: fixed at cc_common.PHYS, or with --vary-physics drawn per episode from physics_ranges
+in the config (cart mass M, pole mass m, pole half-length l, gravity g; constant within an
+episode, LQR gain recomputed for it, pole rendered at its true length). Every episode stores its
+physics as attrs phys_M, phys_m, phys_l, phys_g.
+
 Run:
-  python datagen/generate.py            # full dataset  -> datasets/cc
-  python datagen/generate.py --small    # smoke-test set -> datasets/cc_small
+  python datagen/generate.py                   # full dataset  -> datasets/cc
+  python datagen/generate.py --small           # smoke-test set -> datasets/cc_small
+  python datagen/generate.py --vary-physics    # varied physics -> datasets/cc_phys
 """
 from __future__ import annotations
 
@@ -55,17 +61,18 @@ def lqr_gain(dt=DT, M=PHYS['M'], m=PHYS['m'], l=PHYS['l'], g=PHYS['g']):
     return -(np.linalg.inv(R + Bd.T @ P @ Bd) @ Bd.T @ P @ Ad)[0]
 
 
-def collect_episode(env, mode, length, d, rng, K, amplitude=3.0):
+def collect_episode(env, mode, length, d, rng, K, amplitude=3.0, phys=None):
     lo, hi = env.low, env.high
+    phys = dict(PHYS if phys is None else phys)
     if mode == 'angle_sweep':
         th = float(rng.choice([-1.0, 1.0])) * rng.uniform(d['angle_min'], d['angle_max'])
         v = d.get('angle_velocity_range', 0.2)
         s0 = [rng.uniform(-0.1, 0.1), rng.uniform(-v, v), th, rng.uniform(-v, v)]
-        obs, state = env.reset_to_state(s0)
+        obs, state = env.reset_to_state(s0, phys)
     else:
         r = d[{'random': 'random_init_range', 'prbs': 'pe_init_range',
                'passive': 'passive_init_range'}[mode]]
-        obs, state = env.reset_to_state(rng.uniform(-r, r, size=4))
+        obs, state = env.reset_to_state(rng.uniform(-r, r, size=4), phys)
     sign = float(rng.choice([-1.0, 1.0]))
     O, S, A = [obs], [state], []
     for step in range(length):
@@ -86,16 +93,29 @@ def collect_episode(env, mode, length, d, rng, K, amplitude=3.0):
     if not A:
         return None
     return {'observations': np.stack(O), 'states': np.stack(S).astype(np.float32),
-            'actions': np.asarray(A, np.float32), 'trajectory_type': mode}
+            'actions': np.asarray(A, np.float32), 'trajectory_type': mode, 'physics': phys}
 
 
-def collect(cfg, render=True, small=False, verbose=True):
+PHYS_KEYS = ('M', 'm', 'l', 'g')
+# summary.json names: 'M' and 'm' alone clash in case-insensitive readers such as PowerShell
+SUMMARY_NAME = {'M': 'cart_mass_M', 'm': 'pole_mass_m', 'l': 'pole_half_length_l', 'g': 'gravity_g'}
+
+
+def draw_physics(ranges, prng):
+    """One episode's physics: each parameter uniform in its configured range."""
+    return {k: float(prng.uniform(*ranges[k])) for k in PHYS_KEYS}
+
+
+def collect(cfg, render=True, small=False, verbose=True, vary_physics=False):
     e, d = cfg['environment'], cfg['data']
     rng = np.random.default_rng(int(d.get('seed', 42)))
     env = CartPole(image_size=int(e['image_size']), frame_skip=int(e['frame_skip']),
                    action_range=tuple(e['action_range']), theta_threshold=d['max_abs_theta'],
                    render=render)
     K = lqr_gain()
+    if vary_physics:
+        ranges = cfg['physics_ranges']
+        prng = np.random.default_rng(int(ranges.get('seed', 4242)))
     plan = {'random': (d['n_random_episodes'], d['random_ep_len']),
             'prbs': (d['n_pe_episodes'], d['pe_ep_len']),
             'passive': (d['n_passive_episodes'], d['passive_ep_len']),
@@ -107,7 +127,11 @@ def collect(cfg, render=True, small=False, verbose=True):
         t0 = time.time()
         for k in range(n):
             amp = d['pe_action_amplitudes'][k % len(d['pe_action_amplitudes'])]
-            ep = collect_episode(env, mode, length, d, rng, K, amplitude=amp)
+            if vary_physics:
+                phys = draw_physics(ranges, prng)
+                ep = collect_episode(env, mode, length, d, rng, lqr_gain(**phys), amplitude=amp, phys=phys)
+            else:
+                ep = collect_episode(env, mode, length, d, rng, K, amplitude=amp)
             if ep is not None:
                 episodes.append(ep)
         if verbose:
@@ -142,15 +166,18 @@ def write_split(path, episodes):
             e.create_dataset('states', data=ep['states'])
             e.create_dataset('actions', data=ep['actions'])
             e.attrs['trajectory_type'] = ep['trajectory_type']
+            for k, v in ep.get('physics', PHYS).items():     # phys_M, phys_m, phys_l, phys_g
+                e.attrs[f'phys_{k}'] = float(v)
             n += len(ep['actions'])
         f.attrs['n_episodes'] = len(episodes)
         f.attrs['n_transitions'] = n
 
 
-def simulate_states(small=False):
-    """States only (no rendering), same policies and seed: used by the checks."""
-    eps = collect(load_cfg(), render=False, small=small, verbose=False)
-    return [(ep['states'], ep['actions'].reshape(-1), ep['trajectory_type']) for ep in eps]
+def simulate_states(small=False, vary_physics=False):
+    """States only (no rendering), same policies and seeds: used by the checks.
+    Returns (states, actions, trajectory_type, physics dict) per episode."""
+    eps = collect(load_cfg(), render=False, small=small, verbose=False, vary_physics=vary_physics)
+    return [(ep['states'], ep['actions'].reshape(-1), ep['trajectory_type'], ep['physics']) for ep in eps]
 
 
 def action_stats(eps):
@@ -176,12 +203,15 @@ def action_stats(eps):
 def main():
     p = argparse.ArgumentParser()
     p.add_argument('--small', action='store_true')
+    p.add_argument('--vary-physics', action='store_true',
+                   help='per-episode M, m, l, g from physics_ranges in the config (-> datasets/cc_phys)')
     p.add_argument('--out', default=None)
     a = p.parse_args()
-    out = Path(a.out) if a.out else HERE / 'datasets' / ('cc_small' if a.small else 'cc')
+    name = ('cc_phys' if a.vary_physics else 'cc') + ('_small' if a.small else '')
+    out = Path(a.out) if a.out else HERE / 'datasets' / name
     out.mkdir(parents=True, exist_ok=True)
     cfg = load_cfg()
-    episodes = collect(cfg, render=True, small=a.small)
+    episodes = collect(cfg, render=True, small=a.small, vary_physics=a.vary_physics)
     split = split_episodes(episodes)
     for name, idx in split.items():
         write_split(out / f'{name}.hdf5', [episodes[i] for i in idx])
@@ -196,6 +226,12 @@ def main():
                'usable_transitions_t>=5': int(np.clip(lens - 5, 0, None).sum()),
                'episodes_shorter_than_9_frames': int((lens + 1 < 9).sum()),
                'by_type': action_stats(eps)}
+    P = np.array([[ep['physics'][k] for k in PHYS_KEYS] for ep in episodes])
+    summary['physics'] = {'varied': bool(a.vary_physics),
+                          'ranges': ({SUMMARY_NAME.get(k, k): v for k, v in cfg['physics_ranges'].items()}
+                                     if a.vary_physics else None),
+                          **{SUMMARY_NAME[k]: {'min': float(P[:, i].min()), 'mean': float(P[:, i].mean()),
+                                               'max': float(P[:, i].max())} for i, k in enumerate(PHYS_KEYS)}}
     (out / 'summary.json').write_text(json.dumps(summary, indent=2))
     print(json.dumps(summary, indent=2))
 

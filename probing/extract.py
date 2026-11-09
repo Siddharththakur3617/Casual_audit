@@ -19,7 +19,9 @@ import numpy as np
 import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from cc_common import T_MIN, episode_variables  # noqa: E402
+from cc_common import PHYS, T_MIN, episode_variables  # noqa: E402
+
+PHYS_KEYS = ('M', 'm', 'l', 'g')
 from model.jepa import JEPA  # noqa: E402
 
 
@@ -91,7 +93,7 @@ def extract(ckpt_path, data_dir, split='train', device='cuda', out=None):
     assert T_MIN >= hist and T_MIN >= hist + ctx - 2, 'T_MIN too small for this model'
     image_size = int(model.cfg.get('image_size', 128))
     keys = ('z', 'zhat_next', 'z_next', 'inputs', 'targets', 'xdot', 'thetadot',
-            'episode', 't', 'dzhat_du', 'hist_sens')
+            'episode', 't', 'dzhat_du', 'hist_sens', 'physics')
     acc = {k: [] for k in keys}
     types = []
     with h5py.File(Path(data_dir) / f'{split}.hdf5', 'r') as f:
@@ -118,6 +120,8 @@ def extract(ckpt_path, data_dir, split='train', device='cuda', out=None):
             for k in ('inputs', 'targets', 'xdot', 'thetadot', 't'):
                 acc[k].append(v[k])
             acc['episode'].append(np.full(len(ts), e))
+            phys = [float(ep.attrs.get(f'phys_{k}', PHYS[k])) for k in PHYS_KEYS]   # (M, m, l, g)
+            acc['physics'].append(np.tile(np.asarray(phys, np.float32), (len(ts), 1)))
             tt = ep.attrs.get('trajectory_type', 'unknown')
             types += [tt.decode() if isinstance(tt, bytes) else str(tt)] * len(ts)
     res = {k: np.concatenate(v) for k, v in acc.items()}

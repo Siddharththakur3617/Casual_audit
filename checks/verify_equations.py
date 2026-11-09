@@ -7,10 +7,18 @@
 (e) effect sizes -> final strong/weak tiers
 (f) Markov check: older forces / older states add nothing
 
-Run: python checks/verify_equations.py   -> results/checks.json, results/expert_graph_final.json
+Run: python checks/verify_equations.py                 -> results/checks.json, results/expert_graph_final.json
+     python checks/verify_equations.py --vary-physics  -> results/checks_cc_phys.json,
+                                                          results/expert_graph_final_cc_phys.json
+
+--vary-physics: the dataset policies with per-episode M, m, l, g (datasets/cc_phys). The graph is still the
+28 state/action edges; physics is not a node. Every transition is differentiated at its own episode's physics,
+and the tiers are recomputed over that distribution. Physics draws use their own random stream (PRNG), so the
+fixed-physics run consumes RNG exactly as before and reproduces its outputs.
 """
 from __future__ import annotations
 
+import argparse
 import json
 import sys
 from pathlib import Path
@@ -19,12 +27,25 @@ import numpy as np
 import sympy as sp
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from cc_common import (DT, FRAME_SKIP, H, INPUT_NAMES, PHYS, RESULTS, T_MIN,  # noqa: E402
+from cc_common import (DT, FRAME_SKIP, H, INPUT_NAMES, PHYS, PHYS_KEYS, RESULTS, T_MIN,  # noqa: E402
                        TARGET_NAMES, accelerations, macro_step, stack_episodes)
 import expert_graph  # noqa: E402
 
 RNG = np.random.default_rng(0)
+PRNG = np.random.default_rng(1)      # physics draws (--vary-physics only)
 REPORT = {}
+VARY = False                         # set by --vary-physics
+
+
+def physics_ranges():
+    from datagen.generate import load_cfg
+    return load_cfg()['physics_ranges']
+
+
+def draw_phys(n=None):
+    """Random physics from the configured ranges: floats (n=None) or arrays of length n."""
+    r = physics_ranges()
+    return {k: (float(PRNG.uniform(*r[k])) if n is None else PRNG.uniform(*r[k], size=n)) for k in PHYS_KEYS}
 
 
 def say(name, ok, **info):
@@ -77,12 +98,13 @@ def check_a():
     for _ in range(2000):
         s = np.array([RNG.uniform(-1, 1), RNG.uniform(-3, 3), RNG.uniform(-1.2, 1.2), RNG.uniform(-5, 5)])
         f = RNG.uniform(-10, 10)
+        ph = draw_phys() if VARY else dict(PHYS)
         ref = s.copy()
         for _ in range(FRAME_SKIP):
-            xa = f_xa(ref[1], ref[2], ref[3], f, 1.0, 0.1, 0.5, 9.8, 0.0, 0.0)
-            ta = f_ta(ref[1], ref[2], ref[3], f, 1.0, 0.1, 0.5, 9.8, 0.0, 0.0)
+            xa = f_xa(ref[1], ref[2], ref[3], f, ph['M'], ph['m'], ph['l'], ph['g'], 0.0, 0.0)
+            ta = f_ta(ref[1], ref[2], ref[3], f, ph['M'], ph['m'], ph['l'], ph['g'], 0.0, 0.0)
             ref = ref + H * np.array([ref[1], xa, ref[3], ta])
-        env.reset_to_state(s)
+        env.reset_to_state(s, ph)
         env.step(f)
         err_env = max(err_env, float(np.abs(env.state - ref).max()))
     say('a_equations', err_formula < 1e-9 and err_env < 1e-9,
@@ -99,20 +121,26 @@ def energy(s, M=1.0, m=0.1, l=0.5, g=9.8):
 def check_b():
     s0 = np.column_stack([np.zeros(50), RNG.uniform(-1, 1, 50), RNG.uniform(-0.5, 0.5, 50),
                           RNG.uniform(-1, 1, 50)])
+    ph = draw_phys(len(s0)) if VARY else dict(PHYS)     # one physics per initial state
     drift = {}
     for h in (1e-5, H):
         s = s0.copy()
         for _ in range(int(round(0.5 / h))):
-            s = macro_step(s, 0.0, n=1, h=h, **PHYS)
-        drift[h] = float(np.abs(energy(s) - energy(s0)).max() / np.abs(energy(s0)).max())
+            s = macro_step(s, 0.0, n=1, h=h, **ph)
+        e0, e1 = energy(s0, **ph), energy(s, **ph)
+        drift[h] = float((np.abs(e1 - e0) / np.abs(e0)).max() if VARY else np.abs(e1 - e0).max() / np.abs(e0).max())
     say('b_energy', drift[1e-5] < 1e-3, rel_drift_h1e5=drift[1e-5], rel_drift_h002_for_reference=drift[H])
 
 
 # ---------------------------------------------------------------- data
 def sim_data():
+    """Stacked variables, raw episodes, and every transition's physics (n, 4) in PHYS_KEYS order."""
     from datagen.generate import simulate_states
-    eps = simulate_states()
-    return stack_episodes([(s, a) for s, a, _ in eps]), eps
+    eps = simulate_states(vary_physics=VARY)
+    V = stack_episodes([(s, a) for s, a, _, _ in eps])
+    P_ep = np.array([[ph[k] for k in PHYS_KEYS] for _, _, _, ph in eps])
+    V['physics'] = P_ep[V['episode']]           # stack_episodes' episode index = position in eps
+    return V, eps
 
 
 def r2(y, p):
@@ -140,17 +168,22 @@ def check_c(V):
             res[f'{name}_{label}_R2'] = r2(y[te], p)
             res[f'{name}_{label}_rms_over_std'] = float(np.sqrt(((y[te] - p) ** 2).mean()) / y[te].std())
         res[f'{name}_minus_bar_std'] = float((y - X[:, 1 if name == 'xdot' else 3]).std())
+    # With varied physics the cart's acceleration per newton is 1/(M+m)-like, so a single linear fit
+    # cannot be near-exact; the bar is R2 > 0.99 instead of 0.999 (fixed before running).
+    r2_min = 0.99 if VARY else 0.999
     ok = (res['xdot_frames_plus_u_tm1_rms_over_std'] < 0.5 * res['xdot_frames_only_rms_over_std']
-          and res['xdot_frames_plus_u_tm1_R2'] > 0.999)
-    say('c_observability', ok, **res)
+          and res['xdot_frames_plus_u_tm1_R2'] > r2_min)
+    say('c_observability', ok, r2_min=r2_min, **res)
 
 
 # ---------------------------------------------------------------- (d), (e)
-def transition_map(q):
-    """q = (s_{t-1} (4), u_{t-1}, u_t, u_{t-2}) -> (observed inputs o (7), targets (4))."""
+def transition_map(q, phys=None):
+    """q = (s_{t-1} (4), u_{t-1}, u_t, u_{t-2}) -> (observed inputs o (7), targets (4)).
+    phys: dict of scalars or of per-row arrays (each row at its own episode's physics); default PHYS."""
+    phys = PHYS if phys is None else phys
     s_prev, u_tm1, u_t, u_tm2 = q[..., :4], q[..., 4], q[..., 5], q[..., 6]
-    s_t = macro_step(s_prev, u_tm1, **PHYS)
-    s_n = macro_step(s_t, u_t, **PHYS)
+    s_t = macro_step(s_prev, u_tm1, **phys)
+    s_n = macro_step(s_t, u_t, **phys)
     vbar_t = (s_t[..., 0] - s_prev[..., 0]) / DT
     wbar_t = (s_t[..., 2] - s_prev[..., 2]) / DT
     vbar_n = (s_n[..., 0] - s_t[..., 0]) / DT
@@ -161,14 +194,14 @@ def transition_map(q):
     return o, tg
 
 
-def jacobians(Q, eps=1e-6):
-    """d targets / d observed inputs at each point, via the chain rule through q."""
+def jacobians(Q, phys=None, eps=1e-6):
+    """d targets / d observed inputs at each point, via the chain rule through q. Physics is held fixed."""
     n, k = Q.shape
     Jo, Jt = np.zeros((n, 7, k)), np.zeros((n, 4, k))
     for i in range(k):
         dq = np.zeros(k); dq[i] = eps
-        op, tp = transition_map(Q + dq)
-        om, tm = transition_map(Q - dq)
+        op, tp = transition_map(Q + dq, phys)
+        om, tm = transition_map(Q - dq, phys)
         Jo[:, :, i] = (op - om) / (2 * eps)
         Jt[:, :, i] = (tp - tm) / (2 * eps)
     return np.einsum('nti,nio->nto', Jt, np.linalg.inv(Jo))   # (n, 4 targets, 7 inputs)
@@ -176,15 +209,18 @@ def jacobians(Q, eps=1e-6):
 
 def check_d_e(V, eps_raw):
     # rebuild q = (s_{t-1}, u_{t-1}, u_t, u_{t-2}) for a sample of transitions
-    Q = []
-    for s, a, _ in eps_raw:
+    Q, P = [], []
+    for s, a, _, ph in eps_raw:
         a = a.reshape(-1)
         for t in range(T_MIN, len(a)):
             Q.append(np.r_[s[t - 1], a[t - 1], a[t], a[t - 2]])
-    Q = np.asarray(Q)
-    Q = Q[RNG.choice(len(Q), size=min(4000, len(Q)), replace=False)]
-    o_chk, tg_chk = transition_map(Q)
-    J = jacobians(Q)
+            P.append([ph[k] for k in PHYS_KEYS])
+    Q, P = np.asarray(Q), np.asarray(P)
+    pick = RNG.choice(len(Q), size=min(4000, len(Q)), replace=False)
+    Q, P = Q[pick], P[pick]
+    phys = {k: P[:, i] for i, k in enumerate(PHYS_KEYS)} if VARY else None
+    o_chk, tg_chk = transition_map(Q, phys)
+    J = jacobians(Q, phys)
     sd_in = V['inputs'].std(0)
     sd_tg = V['targets'].std(0)
     # normalised effect: mean |dT_j/do_i| * std(o_i) / std(T_j)   (rows inputs, cols targets)
@@ -197,7 +233,7 @@ def check_d_e(V, eps_raw):
     mism = [f'{INPUT_NAMES[i]}->{TARGET_NAMES[j]} (expert={int(A[i, j])}, measured={maxabs[i, j]:.2g})'
             for i in range(len(INPUT_NAMES)) for j in range(len(TARGET_NAMES)) if nonzero[i, j] != A[i, j]]
     # the data pipeline must reproduce the same variables as the exact map
-    recon = float(np.abs(o_chk - transition_map(Q)[0]).max())
+    recon = float(np.abs(o_chk - transition_map(Q, phys)[0]).max())
     say('d_jacobian_pattern', pattern_ok, mismatches=mism or 'none', recon_err=recon)
 
     tiers_derived = expert_graph.tiers()
@@ -209,7 +245,16 @@ def check_d_e(V, eps_raw):
     changed = [f'{INPUT_NAMES[i]}->{TARGET_NAMES[j]}: {tiers_derived[i, j]} -> {tiers_final[i, j]}'
                for i in range(len(INPUT_NAMES)) for j in range(len(TARGET_NAMES))
                if tiers_derived[i, j] != tiers_final[i, j]]
-    say('e_sensitivity', True, tier_changes=changed or 'none',
+    info = {}
+    if VARY:      # tier changes against the fixed-physics graph, if it exists
+        ref = RESULTS / 'expert_graph_final.json'
+        if ref.exists():
+            t_cc = np.array(json.loads(ref.read_text())['tiers'], dtype=object)
+            info['tier_changes_vs_fixed_physics'] = [
+                f'{INPUT_NAMES[i]}->{TARGET_NAMES[j]}: {t_cc[i, j]} -> {tiers_final[i, j]}'
+                for i in range(len(INPUT_NAMES)) for j in range(len(TARGET_NAMES))
+                if t_cc[i, j] != tiers_final[i, j]] or 'none'
+    say('e_sensitivity', True, tier_changes=changed or 'none', **info,
         n_strong=int((tiers_final == 'strong').sum()), n_weak=int((tiers_final == 'weak').sum()))
     final = {
         'inputs': INPUT_NAMES, 'targets': TARGET_NAMES,
@@ -219,18 +264,19 @@ def check_d_e(V, eps_raw):
         'effect_size': share.tolist(),
         'rule': 'absent = exact zero in Jacobian; strong = normalised effect >= 0.1; else weak',
     }
-    (RESULTS / 'expert_graph_final.json').write_text(json.dumps(final, indent=2))
+    if VARY:
+        final['physics'] = {'varied': True, 'ranges': physics_ranges(),
+                            'note': 'each transition differentiated at its own episode physics; '
+                                    'physics is not a graph node'}
+    (RESULTS / f'expert_graph_final{SUFFIX}.json').write_text(json.dumps(final, indent=2))
 
 
 # ---------------------------------------------------------------- (f)
-def check_f(V):
+def _history_gain(V, base, ext, tr, te):
+    """Per target: held-out R2 of an MLP on base and on ext. Returns (res dict, worst gain)."""
     from sklearn.neural_network import MLPRegressor
     from sklearn.preprocessing import StandardScaler
-    base = V['inputs'][:, :6]                         # without u_{t-2}
-    ext = np.column_stack([V['inputs'], V['d_prev']])  # + u_{t-2} + previous state
-    tr, te = split_by_episode(V['episode'])
-    res = {}
-    worst_gain = -1.0
+    res, worst_gain = {}, -1.0
     for j, nm in enumerate(TARGET_NAMES):
         y = V['targets'][:, j]
         ys = (y - y[tr].mean()) / y[tr].std()
@@ -244,23 +290,52 @@ def check_f(V):
         res[f'{nm}_R2_markov_inputs'] = scores[0]
         res[f'{nm}_R2_plus_history'] = scores[1]
         worst_gain = max(worst_gain, scores[1] - scores[0])
-    say('f_markov', worst_gain < 0.005, max_R2_gain_from_history=float(worst_gain), **res)
+    return res, float(worst_gain)
+
+
+def check_f(V):
+    tr, te = split_by_episode(V['episode'])
+    base = V['inputs'][:, :6]                         # without u_{t-2}
+    ext = np.column_stack([V['inputs'], V['d_prev']])  # + u_{t-2} + previous state
+    if not VARY:
+        res, worst_gain = _history_gain(V, base, ext, tr, te)
+        say('f_markov', worst_gain < 0.005, max_R2_gain_from_history=worst_gain, **res)
+        return
+    # Varied physics. Pass criterion: Markov once the physics is known (physics added to both sets).
+    P = V['physics']
+    res, worst_gain = _history_gain(V, np.column_stack([base, P]), np.column_stack([ext, P]), tr, te)
+    # Diagnostic (not pass/fail): with the physics hidden, as in edge scoring and for the JEPA,
+    # how much the older history (u_{t-2}, previous state) helps, i.e. recovers the physics.
+    hid, hid_gain = _history_gain(V, base, ext, tr, te)
+    say('f_markov', worst_gain < 0.005, max_R2_gain_from_history_given_physics=worst_gain, **res,
+        hidden_physics_max_R2_gain_from_history=hid_gain,
+        **{f'hidden_physics_{k}': v for k, v in hid.items()})
+
+
+SUFFIX = ''                          # '_cc_phys' with --vary-physics
 
 
 def main():
+    global VARY, SUFFIX
+    p = argparse.ArgumentParser()
+    p.add_argument('--vary-physics', action='store_true',
+                   help='per-episode physics as in datasets/cc_phys -> results/*_cc_phys.json')
+    VARY = p.parse_args().vary_physics
+    SUFFIX = '_cc_phys' if VARY else ''
     RESULTS.mkdir(exist_ok=True)
     expert_graph.main()
     check_a()
     check_b()
-    print('[data] simulating states with the dataset policies (no rendering) ...')
+    print('[data] simulating states with the dataset policies (no rendering) '
+          + ('with per-episode physics ' if VARY else '') + '...')
     V, eps_raw = sim_data()
     print(f'[data] {len(V["t"])} usable transitions (t >= {T_MIN}) from {len(eps_raw)} episodes')
     check_c(V)
     check_d_e(V, eps_raw)
     check_f(V)
-    (RESULTS / 'checks.json').write_text(json.dumps(REPORT, indent=2, default=str))
+    (RESULTS / f'checks{SUFFIX}.json').write_text(json.dumps(REPORT, indent=2, default=str))
     n_fail = sum(not r['passed'] for r in REPORT.values())
-    print(f'\n{len(REPORT) - n_fail}/{len(REPORT)} checks passed -> results/checks.json')
+    print(f'\n{len(REPORT) - n_fail}/{len(REPORT)} checks passed -> results/checks{SUFFIX}.json')
     sys.exit(1 if n_fail else 0)
 
 

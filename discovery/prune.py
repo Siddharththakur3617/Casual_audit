@@ -21,6 +21,24 @@ scores from edge_scores.score_graph. Constants are fixed in advance and are not 
   knockoff    Derandomised model-X knockoffs (Candes et al. 2018; Ren, Wei & Candes 2023).
               Per split, W = LOCO(input) - LOCO(its knockoff); knockoff+ at q = 0.1 pooled over
               the 28 edges; kept if selected in >= 50% of splits. Needs decoys='knockoff' scores.
+  null_cal    min_effect with a calibrated threshold (specified 2026-11-10, before any result).
+              Statistic per edge: median over splits of (Dvs - DELTA) / se, i.e. the min_effect test
+              statistic before it is turned into a p-value. The null: the same 50-split scoring
+              repeated on K row-shuffled copies of the targets (discovery/null_calibration.py), so
+              every edge has K null statistics. Exact permutation p-value
+              p = (1 + #{null >= real}) / (K + 1); kept if p <= 0.05 (K = 20: must beat every null).
+              Uses no expert information. (Phipson & Smyth 2010 for the exact p-value.)
+  null_cal_fwer  Same statistic, but each real edge is compared with the LARGEST statistic over all
+              28 edges in each null repeat (max-T; Westfall & Young 1993), so the whole graph, not
+              each edge, has a 5% false-positive rate. Declared together with null_cal.
+  null_cal_vif_fwer  null_cal_fwer with the minimum effect in the expert's unit instead of in unique
+              variance (specified 2026-11-10 AFTER the null_cal results showed which strong edges
+              are missed, so it must be judged on the validation graphs and on datasets/cc, not on
+              the model graphs). LOCO removes only an input's unique part: for a (locally linear)
+              effect b, D ~ b^2 * (1 - R2_i), where R2_i is how well the other inputs predict input
+              i. DELTA = 0.01 = 0.1^2 is the expert's strong cut-off only when R2_i = 0, so here
+              delta_i = DELTA * (1 - R2_i), with R2_i the in-sample linear R2 of input i on the other
+              six inputs (floored at 1e-3). The null statistics use the same delta_i.
 """
 from __future__ import annotations
 
@@ -34,8 +52,30 @@ EFFECT_MIN = 0.1
 KNOCKOFF_Q = 0.1
 KNOCKOFF_FREQ = 0.5
 
-RULES = ('margin', 'fdr', 'min_effect', 'effect', 'effect_fdr', 'knockoff')
+NULL_ALPHA = 0.05
+VIF_FLOOR = 1e-3
+
+RULES = ('margin', 'fdr', 'min_effect', 'effect', 'effect_fdr', 'knockoff', 'null_cal', 'null_cal_fwer',
+         'null_cal_vif_fwer')
 NEEDS_KNOCKOFF = ('knockoff',)
+NEEDS_NULL = ('null_cal', 'null_cal_fwer')
+NEEDS_NULL_VIF = ('null_cal_vif_fwer',)
+
+
+def input_collinearity(X):
+    """R2_i: in-sample linear R2 of each input column on all the others."""
+    X = np.asarray(X, float)
+    r2 = np.zeros(X.shape[1])
+    for i in range(X.shape[1]):
+        A = np.column_stack([np.delete(X, i, axis=1), np.ones(len(X))])
+        coef, *_ = np.linalg.lstsq(A, X[:, i], rcond=None)
+        r2[i] = 1 - np.var(X[:, i] - A @ coef) / np.var(X[:, i])
+    return r2
+
+
+def vif_delta(X, delta=DELTA):
+    """Per-input minimum effect delta_i = delta * (1 - R2_i), shape (n_in, 1) (broadcasts over targets)."""
+    return (delta * np.maximum(1 - input_collinearity(X), VIF_FLOOR))[:, None]
 
 
 def _n_in(scores):
@@ -107,8 +147,47 @@ def rule_knockoff(s, q=KNOCKOFF_Q, freq=KNOCKOFF_FREQ):
     return (knockoff_selection_frequency(s, q) >= freq).astype(int)
 
 
-def prune(scores, rule='margin', knockoff_scores=None):
-    """scores: score_graph(decoys='shuffled') output. The knockoff rule reads knockoff_scores."""
+def null_statistic(Dvs, Dvs_se=None, delta=DELTA):
+    """Calibration statistic per edge: median over splits of (Dvs - delta) / se. Takes either a
+    score_graph output or the (splits, n_in, n_tg) arrays Dvs, Dvs_se (inputs only)."""
+    if Dvs_se is None:
+        n = _n_in(Dvs)
+        Dvs, Dvs_se = Dvs['per_split']['Dvs'][:, :n], Dvs['per_split']['Dvs_se'][:, :n]
+    z = (np.asarray(Dvs) - delta) / np.maximum(np.asarray(Dvs_se), 1e-12)
+    return np.median(z, axis=0)                              # (n_in, n_tg)
+
+
+def _null_array(null_stats):
+    N = np.asarray(null_stats)
+    assert N.ndim == 3 and len(N) >= 1, 'null_stats must be (K, n_in, n_tg); run discovery/null_calibration.py'
+    return N
+
+
+def null_pvalues(s, null_stats, fwer=False, delta=DELTA):
+    """Exact permutation p-values of the real statistic against the K null statistics (which must
+    have been computed with the same delta)."""
+    N, real = _null_array(null_stats), null_statistic(s, delta=delta)
+    if fwer:
+        N = N.max(axis=(1, 2))[:, None, None]                # per null repeat: the largest of all edges
+    return (1 + (N >= real[None]).sum(0)) / (len(N) + 1)
+
+
+def rule_null_cal(s, null_stats, alpha=NULL_ALPHA, fwer=False, delta=DELTA):
+    return (null_pvalues(s, null_stats, fwer, delta) <= alpha).astype(int)
+
+
+def prune(scores, rule='margin', knockoff_scores=None, null_stats=None, null_vif=None):
+    """scores: score_graph(decoys='shuffled') output. The knockoff rule reads knockoff_scores;
+    the null_cal rules read null_stats (K, n_in, n_tg) from discovery/null_calibration.py;
+    null_cal_vif_fwer reads null_vif = (null stats computed with delta_i, delta_i) from
+    null_calibration.load(..., delta=vif_delta(X))."""
+    if rule in NEEDS_NULL_VIF:
+        assert null_vif is not None, f'rule {rule} needs null_vif (null stats with delta_i, delta_i)'
+        stats, delta = null_vif
+        return rule_null_cal(scores, stats, fwer=True, delta=delta)
+    if rule in NEEDS_NULL:
+        assert null_stats is not None, f'rule {rule} needs null_stats (discovery/null_calibration.py)'
+        return rule_null_cal(scores, null_stats, fwer=(rule == 'null_cal_fwer'))
     if rule == 'margin':
         return rule_margin(scores)
     if rule == 'fdr':

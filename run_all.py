@@ -8,10 +8,11 @@
 
 The model's predicted change is read with the differential probe Q_D (probing/fit_probes.py).
 Edge-scoring inputs are the true simulator states plus u_t, u_{t-1}, u_{t-2}.
-Outputs: results/<run>_diff_<rule>/epoch####/{results.json, edges.md, graphs.png, summary.md};
-the curve goes to results/<run>_diff_<rule>/curve_s<splits>/ plus curve.json and curve.png.
+Outputs: results/<run><tag>_diff_<rule>/epoch####/{results.json, edges.md, graphs.png, summary.md},
+where <tag> is _<dataset name> (empty for datasets/cc) plus _<split> when --split is not train;
+the curve goes to results/<run><tag>_diff_<rule>/curve_s<splits>/ plus curve.json and curve.png.
 Runs are resumable: finished checkpoints and cached extractions (runs/<run>/extract/) are reused.
-Data baseline: results/data_baseline_<rule>.json.
+Data baseline: results/data_baseline<tag>_<rule>.json.
 """
 from __future__ import annotations
 
@@ -22,9 +23,11 @@ from pathlib import Path
 
 import numpy as np
 
-from cc_common import INPUT_NAMES, RESULTS, TARGET_NAMES, load_split_episodes, stack_episodes
+import envs
+from cc_common import RESULTS, load_split_episodes, stack_episodes
 from discovery import edge_scores
-from discovery.prune import NEEDS_KNOCKOFF, RULES, prune
+from discovery import null_calibration
+from discovery.prune import NEEDS_KNOCKOFF, NEEDS_NULL, NEEDS_NULL_VIF, RULES, prune, vif_delta
 from evaluate import compare
 from probing import extract as ex
 from probing import fit_probes
@@ -42,13 +45,23 @@ def jsonable(o):
     return o
 
 
-def discover(X, Y, episode, n_splits, label, rule, cross_check=True):
+def split_tag(split):
+    return '' if split == 'train' else f'_{split}'
+
+
+def discover(X, Y, episode, n_splits, label, rule, cross_check=True, data_dir=None, split='train'):
     t0 = time.time()
     s = edge_scores.score_graph(X, Y, episode, n_splits=n_splits)
     ko = (edge_scores.score_graph(X, Y, episode, n_splits=n_splits, decoys='knockoff')
           if rule in NEEDS_KNOCKOFF else None)
+    null_stats = null_vif = None
+    if rule in NEEDS_NULL:      # null scores of the dataset: `python -m discovery.null_calibration`
+        null_stats, _ = null_calibration.load(data_dir, n_splits, split=split)
+    if rule in NEEDS_NULL_VIF:
+        d = vif_delta(X)
+        null_vif = (null_calibration.load(data_dir, n_splits, delta=d, split=split)[0], d)
     s['rule'] = rule
-    s['kept'] = prune(s, rule, knockoff_scores=ko)
+    s['kept'] = prune(s, rule, knockoff_scores=ko, null_stats=null_stats, null_vif=null_vif)
     if ko is not None:
         s['knockoff_scores'] = ko
     if cross_check:
@@ -61,12 +74,12 @@ def discover(X, Y, episode, n_splits, label, rule, cross_check=True):
     return s
 
 
-def data_baseline(data_dir, n_splits, rule):
-    tag = '' if Path(data_dir).name == 'cc' else f'_{Path(data_dir).name}'
+def data_baseline(data_dir, n_splits, rule, split='train'):
+    tag = ('' if Path(data_dir).name == 'cc' else f'_{Path(data_dir).name}') + split_tag(split)
     out = RESULTS / f'data_baseline{tag}_{rule}.json'
-    V = stack_episodes(load_split_episodes(data_dir, 'train'))
-    print(f'[data baseline] {len(V["t"])} transitions')
-    g = discover(V['inputs'], V['targets'], V['episode'], n_splits, 'data', rule)
+    V = stack_episodes(load_split_episodes(data_dir, split))
+    print(f'[data baseline, {split}] {len(V["t"])} transitions')
+    g = discover(V['inputs'], V['targets'], V['episode'], n_splits, 'data', rule, data_dir=data_dir, split=split)
     A, tiers, effect = compare.load_expert(data_dir)
     g['vs_expert'] = compare.vs_expert(g['kept'], g['weight'], A, tiers)
     out.write_text(json.dumps(jsonable(g), indent=2))
@@ -85,11 +98,11 @@ def ckpt_epoch(ckpt):
     return int(torch.load(ckpt, map_location='cpu', weights_only=False).get('epoch', -1))
 
 
-def load_or_extract(ckpt, data_dir):
+def load_or_extract(ckpt, data_dir, split='train'):
     """Extraction is the GPU-heavy step: cache it next to the run so a GPU loss never repeats it.
     An empty or unreadable cache (left by a crash mid-write) is redone."""
     ckpt = Path(ckpt)
-    cache = ckpt.parent.parent / 'extract' / f'{Path(data_dir).name}_{ckpt.stem}.npz'
+    cache = ckpt.parent.parent / 'extract' / f'{Path(data_dir).name}{split_tag(split)}_{ckpt.stem}.npz'
     if cache.exists() and cache.stat().st_size > 0:
         try:
             with np.load(cache) as f:
@@ -97,29 +110,32 @@ def load_or_extract(ckpt, data_dir):
         except Exception as e:   # noqa: BLE001
             print(f'  cache {cache} unreadable ({e}); extracting again')
     t0 = time.time()
-    E = ex.extract(str(ckpt), data_dir, 'train', out=str(cache))
+    E = ex.extract(str(ckpt), data_dir, split, out=str(cache))
     print(f'  extracted {len(E["t"])} transitions -> {cache} ({time.time() - t0:.0f}s)')
     return E
 
 
 def fmt_rep(rep):
+    TARGET_NAMES = envs.current().TARGET_NAMES
     s = ('change R2 enc ' + fmt(TARGET_NAMES, rep['R2_change_encoder_vs_true'])
          + ' | pred ' + fmt(TARGET_NAMES, rep['R2_change_predictor_vs_true']))
     shuf = rep.get('R2_shuffled_label_control')
     return s + (f' | shuffled {np.round(shuf, 3).tolist()}' if shuf is not None else '')
 
 
-def run_checkpoint(ckpt, data_dir, n_splits, base, out_root, rule, probe_only=False, seeds=1):
+def run_checkpoint(ckpt, data_dir, n_splits, base, out_root, rule, probe_only=False, seeds=1, split='train'):
     """One extraction, the differential probe, then the encoder and predictor graphs.
     Resumable: a checkpoint whose results.json already exists is not recomputed."""
     ckpt, t0 = Path(ckpt), time.time()
+    env = envs.use_data(data_dir)
+    TARGET_NAMES = env.TARGET_NAMES
     epoch = ckpt_epoch(ckpt)
     out = out_root / f'epoch{epoch:04d}'
     if not probe_only and (out / 'results.json').exists():
         return json.loads((out / 'results.json').read_text())
     print(f'[epoch {epoch}]', flush=True)
     out.mkdir(parents=True, exist_ok=True)
-    E = load_or_extract(ckpt, data_dir)
+    E = load_or_extract(ckpt, data_dir, split)
     ep, X = E['episode'], E['inputs']
     P = fit_probes.fit_differential(E, seed=0)
     print('  ' + fmt_rep(P['report']), flush=True)
@@ -139,12 +155,14 @@ def run_checkpoint(ckpt, data_dir, n_splits, base, out_root, rule, probe_only=Fa
         return reps
     A, tiers, effect = compare.load_expert(data_dir)
     graphs = {'data': base,
-              'encoder': discover(X, P['dd_enc'], ep, n_splits, 'encoder', rule, cross_check=False),
-              'predictor': discover(X, P['dd_pred'], ep, n_splits, 'predictor', rule)}
-    testable = P['report']['testable(dx,dvbar,dtheta,dwbar)']
+              'encoder': discover(X, P['dd_enc'], ep, n_splits, 'encoder', rule, cross_check=False,
+                                 data_dir=data_dir, split=split),
+              'predictor': discover(X, P['dd_pred'], ep, n_splits, 'predictor', rule, data_dir=data_dir,
+                                    split=split)}
+    testable = P['report'][fit_probes.testable_key()]
     res = {
         'epoch': epoch, 'checkpoint': str(ckpt), 'readout': 'differential', 'rule': rule,
-        'inputs': 'true', 'n_splits': n_splits,
+        'inputs': 'true', 'n_splits': n_splits, 'split': split,
         'probe': P['report'],
         'vs_expert': {n: compare.vs_expert(g['kept'], g['weight'], A, tiers) for n, g in graphs.items()},
         'vs_expert_testable': {n: compare.vs_expert_testable(graphs[n]['kept'], graphs[n]['weight'],
@@ -155,9 +173,9 @@ def run_checkpoint(ckpt, data_dir, n_splits, base, out_root, rule, probe_only=Fa
             'encoder_vs_predictor': compare.between(graphs['encoder'], graphs['predictor']),
             'data_vs_predictor': compare.between(graphs['data'], graphs['predictor']),
         },
-        'action_effect_model': {'rows': ['u_t', 'u_tm1', 'u_tm2'], 'cols': TARGET_NAMES,
+        'action_effect_model': {'rows': [env.INPUT_NAMES[c] for c in env.ACTION_COLS], 'cols': TARGET_NAMES,
                                 'values': P['action_effect']},
-        'action_effect_expert': effect[4:7],
+        'action_effect_expert': effect[env.ACTION_COLS],
         'history_sensitivity_mean(z_t..z_t-4)': E['hist_sens'].mean(0),
         'graphs': {n: g for n, g in graphs.items() if n != 'data'},
     }
@@ -165,7 +183,7 @@ def run_checkpoint(ckpt, data_dir, n_splits, base, out_root, rule, probe_only=Fa
     (out / 'edges.md').write_text(compare.edge_table(graphs, A, tiers, effect, rule))
     compare.heatmaps(graphs, A, tiers, out / 'graphs.png')
     (out / 'summary.md').write_text(f'# Epoch {epoch}: differential probe, pruning rule "{rule}"\n\n'
-                                    f'Inputs: true states. Splits: {n_splits}.\n\n'
+                                    f'Inputs: true states. Splits: {n_splits}. Data split: {split}.\n\n'
                                     + compare.summary(jsonable(res)))
     h = res['vs_expert']['predictor']['strong_graph']
     print(f'  predictor strong graph: F1={h["f1"]:.3f} AUROC={h["auroc"]:.3f} SHD={h["shd"]}'
@@ -174,6 +192,8 @@ def run_checkpoint(ckpt, data_dir, n_splits, base, out_root, rule, probe_only=Fa
 
 
 def curve(run_dir, data_dir, n_splits, base, out_root, rule):
+    env = envs.use_data(data_dir)
+    INPUT_NAMES, TARGET_NAMES = env.INPUT_NAMES, env.TARGET_NAMES
     croot = out_root / f'curve_s{n_splits}'
     cks = sorted(Path(run_dir, 'checkpoints').glob('checkpoint_epoch*.pt'))
     R = [run_checkpoint(ck, data_dir, n_splits, base, croot, rule) for ck in cks]
@@ -242,23 +262,30 @@ def main():
     p.add_argument('--seeds', type=int, default=1, help='probe seed repeats (with --probe-only)')
     p.add_argument('--probe-only', action='store_true',
                    help='only extract and report probe diagnostics (fast, no edge scoring)')
+    p.add_argument('--split', default='train', choices=('train', 'val', 'test'),
+                   help='dataset split to extract and score (default train). val/test = episodes the model '
+                        'never trained on; needs its own null calibration: '
+                        'python -m discovery.null_calibration --data D --split val')
     a = p.parse_args()
+    assert a.split == 'train' or not a.curve, '--curve is only defined for the train split'
+    envs.use_data(a.data)
     RESULTS.mkdir(exist_ok=True)
     run_name = Path(a.run_dir or Path(a.ckpt).parent.parent).name if (a.run_dir or a.ckpt) else None
-    data_tag = '' if Path(a.data).name == 'cc' else f'_{Path(a.data).name}'    # e.g. _cc_phys
+    data_tag = ('' if Path(a.data).name == 'cc' else f'_{Path(a.data).name}') + split_tag(a.split)  # e.g. _cc_phys_val
     out_root = RESULTS / f'{run_name}{data_tag}_diff_{a.prune}' if run_name else None
     if a.probe_only:
         assert a.ckpt, '--probe-only needs --ckpt'
-        run_checkpoint(a.ckpt, a.data, a.splits, None, out_root, a.prune, probe_only=True, seeds=a.seeds)
+        run_checkpoint(a.ckpt, a.data, a.splits, None, out_root, a.prune, probe_only=True, seeds=a.seeds,
+                       split=a.split)
         return
     bpath = RESULTS / f'data_baseline{data_tag}_{a.prune}.json'
     if a.data_baseline or not bpath.exists():
-        base = data_baseline(a.data, a.splits, a.prune)
+        base = data_baseline(a.data, a.splits, a.prune, a.split)
         print(json.dumps(jsonable(base['vs_expert']), indent=2))
     else:
         base = json.loads(bpath.read_text())
     if a.ckpt:
-        run_checkpoint(a.ckpt, a.data, a.splits, base, out_root, a.prune)
+        run_checkpoint(a.ckpt, a.data, a.splits, base, out_root, a.prune, split=a.split)
     if a.curve:
         curve(a.run_dir, a.data, a.splits, base, out_root, a.prune)
 

@@ -1,4 +1,5 @@
-"""Shared constants and helpers for the cart-pole causal-structure study.
+"""Shared constants and helpers. The constants and dynamics here are cart-pole's (envs/cartpole.py
+re-exports them); the generic helpers at the bottom work for any environment in envs/.
 
 Variables (see expert_graph.py):
   inputs  x_t, vbar_t, theta_t, wbar_t, u_t, u_{t-1}, u_{t-2}
@@ -90,11 +91,15 @@ def episode_variables(states, actions, t_min=T_MIN):
     }
 
 
-def stack_episodes(episodes, t_min=T_MIN):
-    """episodes: iterable of (states (T+1,4), actions (T,)). Concatenate variables."""
+def stack_episodes(episodes, t_min=T_MIN, env=None):
+    """episodes: iterable of (states (T+1,k), actions (T,)). Concatenate variables.
+    env: environment spec (default: the active one, envs.current()); cart-pole uses episode_variables above."""
+    if env is None:
+        import envs
+        env = envs.current()
     out, ep_index = {}, []
     for k, (s, a) in enumerate(episodes):
-        v = episode_variables(s, a, t_min=t_min)
+        v = env.episode_variables(s, a, t_min=t_min)
         if v is None:
             continue
         for key, val in v.items():
@@ -108,15 +113,20 @@ def stack_episodes(episodes, t_min=T_MIN):
 PHYS_KEYS = ('M', 'm', 'l', 'g')
 
 
-def episode_physics(attrs):
-    """An episode's physics dict from its HDF5 attrs phys_*, falling back to PHYS (fixed-physics data)."""
-    return {k: float(attrs.get(f'phys_{k}', PHYS[k])) for k in PHYS_KEYS}
+def episode_physics(attrs, env=None):
+    """An episode's physics dict from its HDF5 attrs phys_*, falling back to the env's PHYS (fixed-physics data)."""
+    if env is None:
+        import envs
+        env = envs.current()
+    return {k: float(attrs.get(f'phys_{k}', env.PHYS[k])) for k in env.PHYS_KEYS}
 
 
 def load_split_episodes(data_dir, split='train', with_physics=False):
     """Read per-episode HDF5 (DiscreteHDF5TrajectoryDataset format): (states, actions) per episode,
-    or (states, actions, physics dict) with with_physics=True."""
+    or (states, actions, physics dict) with with_physics=True. Activates the dataset's environment."""
     import h5py
+    import envs
+    envs.use_data(data_dir)
     eps = []
     with h5py.File(Path(data_dir) / f'{split}.hdf5', 'r') as f:
         grp = f['episodes']

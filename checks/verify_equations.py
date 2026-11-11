@@ -320,7 +320,15 @@ def main():
     p = argparse.ArgumentParser()
     p.add_argument('--vary-physics', action='store_true',
                    help='per-episode physics as in datasets/cc_phys -> results/*_cc_phys.json')
-    VARY = p.parse_args().vary_physics
+    p.add_argument('--env', default='cartpole', choices=('cartpole', 'acrobot'),
+                   help='acrobot: run checks/verify_acrobot.py instead')
+    a = p.parse_args()
+    if a.env == 'acrobot':
+        sys.path.insert(0, str(Path(__file__).resolve().parent))
+        import verify_acrobot
+        verify_acrobot.main(['--vary-physics'] if a.vary_physics else [])
+        return
+    VARY = a.vary_physics
     SUFFIX = '_cc_phys' if VARY else ''
     RESULTS.mkdir(exist_ok=True)
     expert_graph.main()

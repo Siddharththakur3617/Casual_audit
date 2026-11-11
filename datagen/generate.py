@@ -16,10 +16,15 @@ in the config (cart mass M, pole mass m, pole half-length l, gravity g; constant
 episode, LQR gain recomputed for it, pole rendered at its true length). Every episode stores its
 physics as attrs phys_M, phys_m, phys_l, phys_g.
 
+Acrobot (--env acrobot, config configs/causal_acrobot.yaml): policies and variables in envs/acrobot.py,
+simulator in sim/acrobot.py; episode types random / prbs / passive / swing; physics attrs phys_m1, phys_m2,
+phys_l1, phys_l2, phys_g. metadata.json records the environment ("env"), which every later step reads.
+
 Run:
   python datagen/generate.py                   # full dataset  -> datasets/cc
   python datagen/generate.py --small           # smoke-test set -> datasets/cc_small
   python datagen/generate.py --vary-physics    # varied physics -> datasets/cc_phys
+  python datagen/generate.py --env acrobot --vary-physics [--small]   # -> datasets/ac_phys[_small]
 """
 from __future__ import annotations
 
@@ -40,10 +45,17 @@ from sim.cartpole import CartPole  # noqa: E402
 
 CFG_PATH = HERE / 'configs' / 'causal_cartpole.yaml'
 TYPES = ('random', 'prbs', 'passive', 'angle_sweep')
+ENV = 'cartpole'                     # set by --env (or by simulate_states(env=...))
+DATASET_PREFIX = {'cartpole': 'cc', 'acrobot': 'ac'}
+
+
+def _spec():
+    import envs
+    return envs.use(ENV)
 
 
 def load_cfg():
-    return yaml.safe_load(CFG_PATH.read_text())
+    return yaml.safe_load((HERE / 'configs' / _spec().CONFIG).read_text())
 
 
 def lqr_gain(dt=DT, M=PHYS['M'], m=PHYS['m'], l=PHYS['l'], g=PHYS['g']):
@@ -101,12 +113,40 @@ PHYS_KEYS = ('M', 'm', 'l', 'g')
 SUMMARY_NAME = {'M': 'cart_mass_M', 'm': 'pole_mass_m', 'l': 'pole_half_length_l', 'g': 'gravity_g'}
 
 
-def draw_physics(ranges, prng):
+def draw_physics(ranges, prng, keys=PHYS_KEYS):
     """One episode's physics: each parameter uniform in its configured range."""
-    return {k: float(prng.uniform(*ranges[k])) for k in PHYS_KEYS}
+    return {k: float(prng.uniform(*ranges[k])) for k in keys}
+
+
+def collect_generic(cfg, spec, render=True, small=False, verbose=True, vary_physics=False):
+    """Episodes for an environment whose policies live in its spec (envs/acrobot.py)."""
+    d = cfg['data']
+    rng = np.random.default_rng(int(d.get('seed', 42)))
+    env = spec.make_env(cfg, render=render)
+    if vary_physics:
+        ranges = cfg['physics_ranges']
+        prng = np.random.default_rng(int(ranges.get('seed', 4242)))
+    episodes = []
+    for mode, (n, length) in spec.episode_plan(d).items():
+        n = max(4, n // 40) if small else n
+        t0 = time.time()
+        for k in range(n):
+            amp = d['pe_action_amplitudes'][k % len(d['pe_action_amplitudes'])]
+            phys = draw_physics(ranges, prng, spec.PHYS_KEYS) if vary_physics else dict(spec.PHYS)
+            ep = spec.collect_episode(env, mode, length, d, rng, amplitude=amp, phys=phys)
+            if ep is not None:
+                episodes.append(ep)
+        if verbose:
+            got = [ep for ep in episodes if ep['trajectory_type'] == mode]
+            print(f'[data] {mode:12s} {len(got)} episodes, {sum(len(x["actions"]) for x in got)} '
+                  f'transitions ({time.time() - t0:.0f}s)', flush=True)
+    return episodes
 
 
 def collect(cfg, render=True, small=False, verbose=True, vary_physics=False):
+    spec = _spec()
+    if spec.NAME != 'cartpole':
+        return collect_generic(cfg, spec, render=render, small=small, verbose=verbose, vary_physics=vary_physics)
     e, d = cfg['environment'], cfg['data']
     rng = np.random.default_rng(int(d.get('seed', 42)))
     env = CartPole(image_size=int(e['image_size']), frame_skip=int(e['frame_skip']),
@@ -145,7 +185,7 @@ def split_episodes(episodes, seed=0, val=0.1, test=0.1):
     """Random split by whole episodes, within each episode type."""
     rng = np.random.default_rng(seed)
     out = {'train': [], 'val': [], 'test': []}
-    for mode in TYPES:
+    for mode in getattr(_spec(), 'TYPES', TYPES):
         idx = [i for i, ep in enumerate(episodes) if ep['trajectory_type'] == mode]
         rng.shuffle(idx)
         nv, nt = int(round(len(idx) * val)), int(round(len(idx) * test))
@@ -166,16 +206,19 @@ def write_split(path, episodes):
             e.create_dataset('states', data=ep['states'])
             e.create_dataset('actions', data=ep['actions'])
             e.attrs['trajectory_type'] = ep['trajectory_type']
-            for k, v in ep.get('physics', PHYS).items():     # phys_M, phys_m, phys_l, phys_g
+            for k, v in ep.get('physics', _spec().PHYS).items():     # e.g. phys_M, phys_m, phys_l, phys_g
                 e.attrs[f'phys_{k}'] = float(v)
             n += len(ep['actions'])
         f.attrs['n_episodes'] = len(episodes)
         f.attrs['n_transitions'] = n
 
 
-def simulate_states(small=False, vary_physics=False):
+def simulate_states(small=False, vary_physics=False, env=None):
     """States only (no rendering), same policies and seeds: used by the checks.
     Returns (states, actions, trajectory_type, physics dict) per episode."""
+    global ENV
+    if env is not None:
+        ENV = env
     eps = collect(load_cfg(), render=False, small=small, verbose=False, vary_physics=vary_physics)
     return [(ep['states'], ep['actions'].reshape(-1), ep['trajectory_type'], ep['physics']) for ep in eps]
 
@@ -183,7 +226,7 @@ def simulate_states(small=False, vary_physics=False):
 def action_stats(eps):
     """Per episode type: corr(u_t, u_{t-1}) and max |corr(u_t, state_t)|."""
     out = {}
-    for typ in TYPES:
+    for typ in getattr(_spec(), 'TYPES', TYPES):
         sel = [(s, a) for s, a, t in eps if t == typ and len(a) >= 2]
         if not sel:
             continue
@@ -194,7 +237,7 @@ def action_stats(eps):
             'episodes': len(sel),
             'transitions': int(sum(len(a) for _, a in sel)),
             'corr_u_t_u_tm1': float(np.corrcoef(u0, u1)[0, 1]) if ok else None,
-            'max_abs_corr_u_state': (float(max(abs(np.corrcoef(u0, S[:, k])[0, 1]) for k in range(4)))
+            'max_abs_corr_u_state': (float(max(abs(np.corrcoef(u0, S[:, k])[0, 1]) for k in range(S.shape[1])))
                                      if ok else None),
         }
     return out
@@ -206,8 +249,13 @@ def main():
     p.add_argument('--vary-physics', action='store_true',
                    help='per-episode M, m, l, g from physics_ranges in the config (-> datasets/cc_phys)')
     p.add_argument('--out', default=None)
+    p.add_argument('--env', default='cartpole', choices=('cartpole', 'acrobot'))
     a = p.parse_args()
-    name = ('cc_phys' if a.vary_physics else 'cc') + ('_small' if a.small else '')
+    global ENV
+    ENV = a.env
+    spec = _spec()
+    pre = DATASET_PREFIX[a.env]
+    name = (f'{pre}_phys' if a.vary_physics else pre) + ('_small' if a.small else '')
     out = Path(a.out) if a.out else HERE / 'datasets' / name
     out.mkdir(parents=True, exist_ok=True)
     cfg = load_cfg()
@@ -219,19 +267,21 @@ def main():
               f'{sum(len(episodes[i]["actions"]) for i in idx)} transitions')
     (out / 'metadata.json').write_text(json.dumps(
         {'action_scale': float(max(abs(v) for v in cfg['environment']['action_range'])),
-         'frame_skip': int(cfg['environment']['frame_skip']), 'dt_transition': DT}, indent=2))
+         'frame_skip': int(cfg['environment']['frame_skip']), 'dt_transition': spec.DT, 'env': a.env},
+        indent=2))
     eps = [(ep['states'], ep['actions'].reshape(-1), ep['trajectory_type']) for ep in episodes]
     lens = np.array([len(ep['actions']) for ep in episodes])
     summary = {'episodes': len(episodes), 'transitions': int(lens.sum()),
                'usable_transitions_t>=5': int(np.clip(lens - 5, 0, None).sum()),
                'episodes_shorter_than_9_frames': int((lens + 1 < 9).sum()),
                'by_type': action_stats(eps)}
-    P = np.array([[ep['physics'][k] for k in PHYS_KEYS] for ep in episodes])
+    P = np.array([[ep['physics'][k] for k in spec.PHYS_KEYS] for ep in episodes])
+    sname = SUMMARY_NAME if a.env == 'cartpole' else {}
     summary['physics'] = {'varied': bool(a.vary_physics),
-                          'ranges': ({SUMMARY_NAME.get(k, k): v for k, v in cfg['physics_ranges'].items()}
+                          'ranges': ({sname.get(k, k): v for k, v in cfg['physics_ranges'].items()}
                                      if a.vary_physics else None),
-                          **{SUMMARY_NAME[k]: {'min': float(P[:, i].min()), 'mean': float(P[:, i].mean()),
-                                               'max': float(P[:, i].max())} for i, k in enumerate(PHYS_KEYS)}}
+                          **{sname.get(k, k): {'min': float(P[:, i].min()), 'mean': float(P[:, i].mean()),
+                                               'max': float(P[:, i].max())} for i, k in enumerate(spec.PHYS_KEYS)}}
     (out / 'summary.json').write_text(json.dumps(summary, indent=2))
     print(json.dumps(summary, indent=2))
 

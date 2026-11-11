@@ -6,7 +6,13 @@ import json
 import numpy as np
 from sklearn.metrics import average_precision_score, roc_auc_score
 
-from cc_common import INPUT_NAMES, RESULTS, TARGET_NAMES
+import envs
+from cc_common import RESULTS
+
+
+def _names():
+    e = envs.current()
+    return e.INPUT_NAMES, e.TARGET_NAMES
 
 
 def expert_path(data_dir=None):
@@ -25,6 +31,7 @@ def expert_path(data_dir=None):
 
 
 def load_expert(data_dir=None):
+    envs.use_data(data_dir)
     e = json.loads(expert_path(data_dir).read_text())
     return np.array(e['adjacency']), np.array(e['tiers'], dtype=object), np.array(e['effect_size'])
 
@@ -44,12 +51,13 @@ def _auc(y, w):
 
 
 def vs_expert(kept, weight, A, tiers):
+    INPUT_NAMES, TARGET_NAMES = _names()
     kept, A = np.asarray(kept).astype(bool), np.asarray(A).astype(bool)
     w = np.asarray(weight)
     strong_or_absent = (tiers == 'strong') | (tiers == 'absent')
     ys = (tiers == 'strong')[strong_or_absent]
     weak = tiers == 'weak'
-    return {
+    out = {
         'strong_graph': {**_prf(ys, kept[strong_or_absent]), **_auc(ys, w[strong_or_absent]),
                          'n_pos': int(ys.sum()), 'n_neg': int((~ys).sum())},
         'full_graph': {**_prf(A.ravel(), kept.ravel()), **_auc(A.ravel(), w.ravel()),
@@ -60,11 +68,18 @@ def vs_expert(kept, weight, A, tiers):
         'strong_edges_missed': [f'{INPUT_NAMES[i]}->{TARGET_NAMES[j]}'
                                 for i, j in zip(*np.where(~kept & (tiers == 'strong')))],
     }
+    env = envs.current()
+    if hasattr(env, 'cross_mask'):          # acrobot: edges between the arm and the distractor (all absent)
+        cm = env.cross_mask()
+        out['cross_edges_kept'] = [f'{INPUT_NAMES[i]}->{TARGET_NAMES[j]}' for i, j in zip(*np.where(kept & cm))]
+        out['n_cross_edges'] = int(cm.sum())
+    return out
 
 
 def vs_expert_testable(kept, weight, A, tiers, testable):
     """Same as vs_expert's strong-graph scores, but only over edges into testable targets.
     testable: (n_targets,) bool. Edges into untestable targets are dropped, not counted as misses."""
+    INPUT_NAMES, TARGET_NAMES = _names()
     cols = np.asarray(testable, dtype=bool)
     kept, w = np.asarray(kept).astype(bool), np.asarray(weight)
     sel = ((tiers == 'strong') | (tiers == 'absent')) & cols[None, :]
@@ -94,6 +109,7 @@ def emergence(epochs, kept_series):
 
 def summary(res):
     """Markdown summary table for one checkpoint (differential readout)."""
+    INPUT_NAMES, TARGET_NAMES = _names()
     rows = ['| metric | value |', '|---|---|']
 
     def row(name, f):
@@ -110,6 +126,9 @@ def summary(res):
         row(f'{g} kept / false pos.', lambda r, g=g: f"{int(np.sum(r['graphs'][g]['kept']))} / "
                                                      f"{len(r['vs_expert'][g]['absent_edges_wrongly_kept'])}")
         row(f'{g} strong F1 (testable only)', lambda r, g=g: r['vs_expert_testable'][g]['f1'])
+    if 'cross_edges_kept' in res['vs_expert'].get('predictor', {}):
+        for g in ('predictor', 'encoder'):
+            row(f'{g} arm-distractor cross edges kept', lambda r, g=g: len(r['vs_expert'][g]['cross_edges_kept']))
     row('Spearman data vs predictor', lambda r: r['attribution']['data_vs_predictor']['weight_spearman'])
     row('Spearman encoder vs predictor', lambda r: r['attribution']['encoder_vs_predictor']['weight_spearman'])
     for j, t in enumerate(TARGET_NAMES):
@@ -122,6 +141,7 @@ def summary(res):
 
 def between(g1, g2):
     """Disagreement between two learned graphs."""
+    INPUT_NAMES, TARGET_NAMES = _names()
     k1, k2 = np.asarray(g1['kept']).astype(bool), np.asarray(g2['kept']).astype(bool)
     from scipy.stats import spearmanr
     return {
@@ -134,6 +154,7 @@ def between(g1, g2):
 
 def edge_table(graphs, A, tiers, effect, rule='margin'):
     """Markdown per-edge table: tier, expert effect size, and weight/stability/kept per graph."""
+    INPUT_NAMES, TARGET_NAMES = _names()
     names = list(graphs)
     head = '| edge | tier | expert effect | ' + ' | '.join(f'{n} weight (stab.)' for n in names) + ' |'
     rows = [head, '|' + '---|' * (3 + len(names))]
@@ -156,6 +177,7 @@ def heatmaps(graphs, A, tiers, path):
     import matplotlib
     matplotlib.use('Agg')
     import matplotlib.pyplot as plt
+    INPUT_NAMES, TARGET_NAMES = _names()
     names = ['expert'] + list(graphs)
     fig, axes = plt.subplots(1, len(names), figsize=(3.2 * len(names), 3.6), constrained_layout=True)
     for ax, n in zip(axes, names):

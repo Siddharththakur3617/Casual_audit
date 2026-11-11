@@ -27,7 +27,7 @@ import numpy as np
 from sklearn.metrics import roc_auc_score
 
 from cc_common import INPUT_NAMES, RESULTS, TARGET_NAMES, load_split_episodes, stack_episodes
-from discovery import edge_scores, prune as pr
+from discovery import edge_scores, null_calibration, prune as pr
 from evaluate import compare
 from probing import fit_probes
 from run_all import ckpt_epoch, jsonable, load_or_extract
@@ -41,7 +41,11 @@ RULE_SCORE = {   # the continuous score each rule thresholds (for a threshold-fr
     'effect': lambda s, k: np.asarray(s['jacobian_effect']),
     'effect_fdr': lambda s, k: np.asarray(s['jacobian_effect']),
     'knockoff': lambda s, k: pr.knockoff_selection_frequency(k),
+    'null_cal': lambda s, k: pr.null_statistic(s),
+    'null_cal_fwer': lambda s, k: pr.null_statistic(s),
+    'null_cal_vif_fwer': lambda s, k: pr.null_statistic(s, delta=DELTA_VIF),
 }
+DELTA_VIF = None                           # per-input delta_i of null_cal_vif_fwer, set in main()
 
 
 def load_scores(path):
@@ -103,6 +107,8 @@ def main():
     p.add_argument('--data', required=True)
     p.add_argument('--run-dir', required=True)
     p.add_argument('--splits', type=int, default=50)
+    p.add_argument('--null-reps', type=int, default=null_calibration.REPS,
+                   help='shuffled-target repeats that calibrate the null_cal rules')
     p.add_argument('--out', default=None, help='output folder (default results/pruning_comparison_<data>_<run>)')
     a = p.parse_args()
     global OUT
@@ -133,34 +139,53 @@ def main():
             'last_checkpoint': last.name, 'noise_R2': noise_r2.tolist(), 'n_splits': a.splits}
     print(f'[setup] {meta}', flush=True)
 
+    # null scores for the null_cal rules: same rows, targets shuffled; cached, shared with run_all.py
+    null_dir = OUT / 'null_calibration' if a.out else None
+    print(f'[null calibration] {a.null_reps} shuffled-target repeats', flush=True)
+    null_calibration.calibrate(a.data, a.null_reps, a.splits, out_dir=null_dir)
+    null_stats, null_r2 = null_calibration.load(a.data, a.splits, a.null_reps, out_dir=null_dir)
+    meta.update(null_reps=len(null_stats), null_heldout_R2=null_r2.tolist())
+    # null_cal_vif_fwer: delta_i from the collinearity of the inputs (the same rows in every graph)
+    global DELTA_VIF
+    DELTA_VIF = pr.vif_delta(X)
+    null_vif = (null_calibration.load(a.data, a.splits, a.null_reps, out_dir=null_dir, delta=DELTA_VIF)[0], DELTA_VIF)
+    meta.update(input_R2_on_others=pr.input_collinearity(X).tolist(), vif_delta=DELTA_VIF[:, 0].tolist())
+
     res, kept_all = {}, {}
     for g, (Xg, Yg, eg) in graphs.items():
         print(f'[{g}]', flush=True)
+        assert Xg.shape == X.shape, 'every graph must be scored on the same rows as the null calibration'
         s = scored(g, Xg, Yg, eg, a.splits, 'shuffled')
         k = scored(g, Xg, Yg, eg, a.splits, 'knockoff')
         res[g], kept_all[g] = {}, {}
         for rule in pr.RULES:
-            kept = pr.prune(s, rule, knockoff_scores=k)
+            kept = pr.prune(s, rule, knockoff_scores=k, null_stats=null_stats, null_vif=null_vif)
             kept_all[g][rule] = kept
             res[g][rule] = evaluate(kept, RULE_SCORE[rule](s, k), A, tiers)
         res[g]['_heldout_R2'] = s['heldout_R2']
         res[g]['_knockoff_s'] = k['knockoff_s']
         res[g]['_jacobian_effect'] = s['jacobian_effect']
+        res[g]['_null_statistic'] = pr.null_statistic(s)
+        res[g]['_null_pvalue'] = pr.null_pvalues(s, null_stats)
         print('  ' + ' | '.join(f'{r}: kept {res[g][r]["kept"]} F1 {res[g][r]["f1"]:.2f} FP {res[g][r]["false_pos"]}'
                                 for r in pr.RULES), flush=True)
-    (OUT / 'comparison.json').write_text(json.dumps(jsonable({'meta': meta, 'results': res, 'kept': kept_all}),
-                                                    indent=2))
-    (OUT / 'report.md').write_text(report(res, kept_all, tiers, effect, meta))
+    null_info = {'statistic_max_per_edge': null_stats.max(0), 'statistic_median_per_edge': np.median(null_stats, 0),
+                 'max_over_edges_per_repeat': null_stats.max(axis=(1, 2))}
+    (OUT / 'comparison.json').write_text(json.dumps(jsonable({'meta': meta, 'results': res, 'kept': kept_all,
+                                                              'null_calibration': null_info}), indent=2))
+    (OUT / 'report.md').write_text(report(res, kept_all, tiers, effect, meta, null_info))
     print(f'-> {OUT / "report.md"}')
 
 
-def report(res, kept_all, tiers, effect, meta):
+def report(res, kept_all, tiers, effect, meta, null_info=None):
     G = list(res)
     n_s, n_w, n_a = (int((tiers == t).sum()) for t in ('strong', 'weak', 'absent'))
     L = ['# Pruning rules compared (differential probe, true-state inputs)', '',
          f'Dataset `{meta["data"]}` · model `{meta["run_dir"]}` (last checkpoint `{meta["last_checkpoint"]}`) · '
          f'expert graph `{meta["expert_file"]}` · {meta["n_splits"]} splits · data_noisy R2 cap '
          f'{np.round(meta["noise_R2"], 3).tolist()} (dx, dvbar, dtheta, dwbar).', '',
+         f'null_cal rules: {meta.get("null_reps")} shuffled-target repeats (null fits reach held-out R2 '
+         f'{np.round(meta.get("null_heldout_R2", []), 2).tolist()}). '
          'Cell = strong-graph F1 · edges kept · false positives (absent edges kept). '
          f'Expert graph: {n_s} strong, {n_w} weak, {n_a} absent. `null` should keep 0.', '',
          '| rule | ' + ' | '.join(G) + ' |', '|---|' + '---|' * len(G)]
@@ -190,6 +215,26 @@ def report(res, kept_all, tiers, effect, meta):
         L.append(f'\nHeld-out R2 {np.round(res[g]["_heldout_R2"], 3).tolist()}; knockoff s '
                  f'{np.round(res[g]["_knockoff_s"], 3).tolist()} (0 = knockoff identical to the input). '
                  'Absent edges not kept by any rule are omitted.')
+    if null_info is not None:
+        M = np.asarray(null_info['statistic_max_per_edge'])
+        L += ['', '## null calibration (shuffled targets)', '',
+              f'Largest statistic of each edge over the {meta.get("null_reps")} null repeats (the null_cal threshold: a real '
+              'edge must exceed it). The statistic is the median over splits of (Dvs - 0.01) / se; above ~0 means the edge '
+              'beats a decoy by more than 1% of the target variance.', '',
+              '| input | ' + ' | '.join(TARGET_NAMES) + ' |', '|---|' + '---|' * len(TARGET_NAMES)]
+        for i, n in enumerate(INPUT_NAMES):
+            L.append(f'| {n} | ' + ' | '.join(f'{M[i, j]:.2f}' for j in range(len(TARGET_NAMES))) + ' |')
+        mx = np.asarray(null_info['max_over_edges_per_repeat'])
+        L.append(f'\nnull_cal_fwer threshold: largest statistic over all 28 edges in a repeat, max {mx.max():.2f} '
+                 f'(median {np.median(mx):.2f}).')
+    if 'vif_delta' in meta:
+        L += ['', '## null_cal_vif_fwer: per-input minimum effect', '',
+              'delta_i = 0.01 * (1 - R2_i), R2_i = linear R2 of input i on the other six inputs. '
+              'Specified after the null_cal results: judge it on data, data_noisy, null and epoch 0, '
+              'and confirm on datasets/cc.', '',
+              '| input | R2 on others | delta_i |', '|---|---|---|']
+        for n, r2, d in zip(INPUT_NAMES, meta['input_R2_on_others'], meta['vif_delta']):
+            L.append(f'| {n} | {r2:.3f} | {d:.5f} |')
     return '\n'.join(L) + '\n'
 
 

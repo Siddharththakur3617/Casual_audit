@@ -6,7 +6,7 @@ The frozen fold nets then read the PREDICTOR's change zhat_{t+1} - z_t. Q_D sees
 change (never z_t), and the predictor is never used to fit it.
 
 The normal (state-difference) and hybrid readouts, and the legacy linear readouts, were removed
-on 2026-11-09; the old code is in _archive/2026-11-09_three_arms_and_old_pruning/.
+on 2026-11-09.
 """
 from __future__ import annotations
 
@@ -14,7 +14,8 @@ import numpy as np
 
 N_FOLDS = 5
 TESTABLE_R2 = 0.5          # fixed in advance: a target whose encoder-change R2 is below this is untestable
-ACTION_EPS = 0.1           # newtons: step of the finite difference along d zhat / d u
+ACTION_EPS = 0.1           # newtons: step of the finite difference along d zhat / d u (cart-pole default;
+                           # fit_differential uses the active environment's ACTION_EPS)
 NET_SEED = 200
 
 
@@ -72,13 +73,16 @@ def mlp_cross_fit(z, y, episode, hidden=256, epochs=40, batch=512, lr=1e-3, seed
     return pred, r2(y, pred), extra
 
 
-def fit_differential(E, seed=0, shuffle_control=True, eps=ACTION_EPS):
+def fit_differential(E, seed=0, shuffle_control=True, eps=None):
     """E: output of extract.extract(). Returns {'dd_pred', 'dd_enc', 'action_effect', 'report'}.
 
     action_effect: finite difference of Q_D along d zhat / d u for u_t, u_{t-1}, u_{t-2}, normalised
     like the expert effect sizes: mean |d change / d u| * sd(u) / sd(change)."""
+    import envs
+    env = envs.current()
+    eps = env.ACTION_EPS if eps is None else eps
     z, zh, zn, ep = E['z'], E['zhat_next'], E['z_next'], E['episode']
-    dd_true, U = E['targets'], E['inputs'][:, 4:7]
+    dd_true, U = E['targets'], E['inputs'][:, env.ACTION_COLS]
     g = E['dzhat_du']                                   # (n, d, 3): d zhat / d u per newton
     dz_enc, dz_pred = zn - z, zh - z
     ev_in = {'pred': dz_pred}
@@ -104,10 +108,16 @@ def fit_differential(E, seed=0, shuffle_control=True, eps=ACTION_EPS):
     rep['R2_gap_encoder_minus_predictor'] = (r_enc - r_pred).tolist()
     rep['R2_change_predictor_vs_encoder'] = r2(dd_enc, dd_pred).tolist()
     rep['testable_threshold'] = TESTABLE_R2
-    rep['testable(dx,dvbar,dtheta,dwbar)'] = [bool(v >= TESTABLE_R2) for v in r_enc]
+    rep[testable_key()] = [bool(v >= TESTABLE_R2) for v in r_enc]
     if 'physics' in E and np.ptp(E['physics'], axis=0).max() > 0:
-        rep['R2_by_physics_tercile'] = r2_by_physics(E['physics'], dd_true, dd_enc, dd_pred)
+        rep['R2_by_physics_tercile'] = r2_by_physics(E['physics'], dd_true, dd_enc, dd_pred, names=env.PHYS_KEYS)
     return {'dd_pred': dd_pred, 'dd_enc': dd_enc, 'report': rep, 'action_effect': effect}
+
+
+def testable_key():
+    """Report key, e.g. 'testable(dx,dvbar,dtheta,dwbar)' for cart-pole."""
+    import envs
+    return 'testable(' + ','.join(envs.current().TARGET_NAMES) + ')'
 
 
 def r2_by_physics(phys, dd_true, dd_enc, dd_pred, names=('M', 'm', 'l', 'g')):

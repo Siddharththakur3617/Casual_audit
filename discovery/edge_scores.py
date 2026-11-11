@@ -36,7 +36,8 @@ import torch.nn as nn
 from scipy.stats import spearmanr
 
 DECOYS = ['decoy_u_t', 'decoy_theta']
-DECOY_SOURCE = [4, 2]        # columns of X that the shuffled decoys are copies of
+DECOY_SOURCE = [4, 2]        # columns of X that the shuffled decoys are copies of (cart-pole; the active
+                             # environment's envs.<env>.DECOY_SOURCE is used at run time)
 # Margin of the original pruning rule (prune.rule_margin): an edge must raise held-out error at
 # least 50% more than removing a decoy does. Fixed in advance (not tuned on the expert graph).
 MARGIN = float(np.log(1.5))
@@ -99,8 +100,22 @@ def standardise(Xa, Xb):
     return (Xa - m) / s, (Xb - m) / s
 
 
-def with_decoys(X, rng):
-    return np.column_stack([X] + [X[rng.permutation(len(X)), c] for c in DECOY_SOURCE])
+def with_decoys(X, rng, source=None):
+    source = DECOY_SOURCE if source is None else source
+    return np.column_stack([X] + [X[rng.permutation(len(X)), c] for c in source])
+
+
+def with_group_decoys(X, groups, rng, source):
+    """Decoys for grouped nodes: each decoy is a row-shuffled copy of all columns of a source node.
+    Returns (X with decoy columns, groups including the decoy nodes)."""
+    cols, groups = [X], [list(g) for g in groups]
+    n = X.shape[1]
+    for src in source:
+        c = groups[src]
+        cols.append(X[rng.permutation(len(X))][:, c])
+        groups.append(list(range(n, n + len(c))))
+        n += len(c)
+    return np.column_stack(cols), groups
 
 
 # ---------------------------------------------------------------------------
@@ -152,26 +167,35 @@ def _cluster_mean_se(a, n_e):
     return theta, np.sqrt(E / (E - 1) * (r ** 2).sum(0)) / N
 
 
-def loco_split(Xa, Ya, Xb, Yb, ep_b, seed, device, steps, n_dec):
+def loco_split(Xa, Ya, Xb, Yb, ep_b, seed, device, steps, n_dec, drop=None):
     """One split. Returns per-split arrays (see module docstring). The last n_dec columns of X are
-    decoys/knockoffs."""
-    n_in, n_tg = Xa.shape[1], Ya.shape[1]
+    decoys/knockoffs. drop: the columns that get a leave-out variant (default all); other columns
+    (conditioning inputs) are seen by every variant and get no score. Outputs are indexed by drop."""
+    n_cols, n_tg = Xa.shape[1], Ya.shape[1]
+    drop = list(range(n_cols)) if drop is None else list(drop)
+    drop = [list(d) if isinstance(d, (list, tuple)) else [d] for d in drop]   # a node = one or more columns
+    n_in = len(drop)
     n_var = n_in + 1                                       # variant 0 = all inputs
-    mask = torch.ones(n_var, n_in)
-    for i in range(n_in):
-        mask[i + 1, i] = 0.0
+    mask = torch.ones(n_var, n_cols)
+    for v, cols in enumerate(drop):
+        mask[v + 1, cols] = 0.0
     mask = mask.repeat_interleave(n_tg, dim=0)              # network k = variant k//n_tg, target k%n_tg
     torch.manual_seed(seed)
-    net = GroupMLP(n_var * n_tg, n_in, mask=mask).to(device)
+    net = GroupMLP(n_var * n_tg, n_cols, mask=mask).to(device)
     net.tie_init(n_tg)
     T = lambda v: torch.as_tensor(v, dtype=torch.float32, device=device)  # noqa: E731
     train(net, T(Xa), T(Ya).repeat(1, n_var), steps=steps)
     xb = T(Xb).requires_grad_(True)
     out = net(xb)
     J = np.zeros((n_in, n_tg))
+    single = all(len(c) == 1 for c in drop)
     for j in range(n_tg):                                   # networks 0..n_tg-1 = full model
         g, = torch.autograd.grad(out[:, j].sum(), xb, retain_graph=j < n_tg - 1)
-        J[:, j] = g.abs().mean(0).detach().cpu().numpy()
+        if single:
+            J[:, j] = g.abs().mean(0).detach().cpu().numpy()[[c[0] for c in drop]]
+        else:                                               # grouped node: gradient norm over its columns
+            g = g.detach()
+            J[:, j] = [g[:, c].norm(dim=1).mean().item() for c in drop]
     with torch.no_grad():
         se = ((out.detach() - T(Yb).repeat(1, n_var)) ** 2).reshape(len(Xb), n_var, n_tg).cpu().numpy()
     vy = Yb.var(0)
@@ -190,27 +214,45 @@ def loco_split(Xa, Ya, Xb, Yb, ep_b, seed, device, steps, n_dec):
 
 
 def score_graph(X, Y, episode, n_splits=50, seed=0, device='cuda', steps=1500, decoys='shuffled',
-                verbose=False):
+                verbose=False, cond=None):
     """Scores for every edge (inputs X -> targets Y). Returns summary arrays plus 'per_split'.
 
-    decoys='shuffled' reproduces the original scores exactly (same random stream)."""
+    decoys='shuffled' reproduces the original scores exactly (same random stream).
+    cond: optional (n, k) conditioning inputs (e.g. episode physics). Every fit sees them, none is
+    left out and they are not graph nodes: the edges are then scored with cond held known."""
+    import envs
+    env = envs.current()
+    X, groups = env.edge_features(X)          # cart-pole: X itself, one column per node (groups None)
     device = device if torch.cuda.is_available() else 'cpu'
     rng = np.random.default_rng(seed)
-    n_in, n_tg = X.shape[1], Y.shape[1]
+    n_in = X.shape[1] if groups is None else len(groups)
+    n_tg = Y.shape[1]
+    n_c = 0 if cond is None else np.asarray(cond).shape[1]
     if decoys == 'shuffled':
-        n_dec, ko = len(DECOYS), None
+        n_dec, ko = len(env.DECOY_SOURCE), None
     elif decoys == 'knockoff':
+        if groups is not None:
+            raise NotImplementedError('knockoff decoys are not implemented for grouped (sin, cos) nodes')
         n_dec, ko = n_in, GaussianKnockoffs(X)
     else:
         raise ValueError(decoys)
     keys = ('L', 'D', 'Dvs', 'Dvs_se', 'J', 'R2')
     per = {k: [] for k in keys}
     for s in range(n_splits):
-        Xd = with_decoys(X, rng) if ko is None else np.column_stack([X, ko.sample(X, rng)])
+        if groups is None:
+            Xd = (with_decoys(X, rng, env.DECOY_SOURCE) if ko is None
+                  else np.column_stack([X, ko.sample(X, rng)]))
+            drop = None
+            if n_c:                                         # columns: inputs, decoys, then cond
+                drop = list(range(Xd.shape[1]))
+        else:
+            Xd, drop = with_group_decoys(X, groups, rng, env.DECOY_SOURCE)
+        if n_c:
+            Xd = np.column_stack([Xd, cond])
         a, b = half_split(episode, rng)
         Xa, Xb = standardise(Xd[a], Xd[b])
         Ya, Yb = standardise(Y[a], Y[b])
-        r = loco_split(Xa, Ya, Xb, Yb, episode[b], seed * 1000 + s, device, steps, n_dec)
+        r = loco_split(Xa, Ya, Xb, Yb, episode[b], seed * 1000 + s, device, steps, n_dec, drop=drop)
         for k in keys:
             per[k].append(r[k])
         if verbose and (s + 1) % 10 == 0:
@@ -228,6 +270,7 @@ def score_graph(X, Y, episode, n_splits=50, seed=0, device='cuda', steps=1500, d
         'jacobian_effect': per['J'][:, :n_in, :].mean(0),
         'heldout_R2': per['R2'].mean(0),
         'n_splits': n_splits,
+        'n_cond': n_c,
         'per_split': per,
     }
     if decoys == 'shuffled':                                 # the original rule's stability
@@ -241,6 +284,8 @@ def group_lasso_weights(X, Y, episode, lams=(0.0, 1e-3, 3e-3, 1e-2, 3e-2, 1e-1),
                         seed=0, device='cuda', steps=1500):
     """Neural-Granger cross-check. Per target, the largest lambda whose held-out R2 is
     within `tol` of the unpenalised fit; weight = first-layer row norm of each input."""
+    import envs
+    X, groups = envs.current().edge_features(X)
     device = device if torch.cuda.is_available() else 'cpu'
     rng = np.random.default_rng(seed + 7)
     a, b = half_split(episode, rng)
@@ -253,9 +298,12 @@ def group_lasso_weights(X, Y, episode, lams=(0.0, 1e-3, 3e-3, 1e-2, 3e-2, 1e-1),
         net = train(GroupMLP(Y.shape[1], X.shape[1]).to(device), T(Xa), T(Ya), steps=steps, lam=lam)
         with torch.no_grad():
             r2 = (1 - ((net(T(Xb)) - T(Yb)) ** 2).mean(0) / T(Yb).var(0)).cpu().numpy()
-        fits.append((lam, r2, net.W1.detach().norm(dim=-1).cpu().numpy().T))   # (n_in, n_tg)
+        w = net.W1.detach().norm(dim=-1).cpu().numpy().T                     # (n_cols, n_tg)
+        if groups is not None:                                              # node norm over its columns
+            w = np.stack([np.sqrt((w[g] ** 2).sum(0)) for g in groups])
+        fits.append((lam, r2, w))
     ref = fits[0][1]
-    weight = np.zeros((X.shape[1], Y.shape[1]))
+    weight = np.zeros((fits[0][2].shape[0], Y.shape[1]))
     chosen = []
     for j in range(Y.shape[1]):
         lam, _, w = [f for f in fits if f[1][j] >= ref[j] - tol][-1]

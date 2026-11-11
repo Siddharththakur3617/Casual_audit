@@ -1,139 +1,178 @@
-# Causal structure learned by a cart-pole JEPA
+# Do JEPA world models learn causal structure?
 
-How much of cart-pole's causal structure has a pixels-only JEPA world model learned?
+A JEPA world model is trained on rendered frames only (no state input). We read a cause-and-effect graph out of its *predicted* state changes and compare it with the graph derived from the exact physics equations. The study covers two environments: **cart-pole** and **Acrobot** (a double pendulum with an unrelated distractor object).
 
-Method (current, 2026-11-10):
-1. **Data: `datasets/cc_phys`.** Every episode has its own cart mass, pole mass, pole length and gravity (see below). The physics varies only in the background: the causal graph is still the 28 edges [x, v̄, θ, ω̄, u_t, u_{t−1}, u_{t−2}] → [Δx, Δv̄, Δθ, Δω̄], because within an episode the physics does not change.
-2. **Readout.** The **differential probe** Q_D (MLP 192 → 256 → 256 → 4) reads the change Δd from a latent change. It is fitted on the encoder's change z_{t+1} − z_t and then reads the predictor's change ẑ_{t+1} − z_t (5-latent history). It is the only readout: the normal and hybrid arms were removed on 2026-11-09 (old code in `_archive/2026-11-09_three_arms_and_old_pruning/`).
-3. **Edges.** Every edge from the true inputs to the read-out change is scored with LOCO over 50 episode half-splits and pruned with a rule from `discovery/prune.py` (`--prune`). The result is compared with the expert graph for the dataset: `results/expert_graph_final_cc_phys.json` for cc_phys, from `checks/verify_equations.py --vary-physics`, where each transition is differentiated at its own physics.
-4. **Rule choice.** `compare_pruning.py` compares the pruning rules on the same scores (see "Pruning rules" below).
+**Results, discussion and related work are in [BTP_REPORT.md](BTP_REPORT.md).** This README covers what the code does, how to run it, and where each output goes.
 
-### Current run order (PowerShell, from this folder)
+## Status (2026-11-12)
+
+| | Cart-pole (`datasets/cc_phys`) | Acrobot (`datasets/ac_phys`) |
+|---|---|---|
+| Equation checks and expert graph | done, 6/6 pass | done, 6/6 pass |
+| JEPA training (200 epochs) | done (`runs/jepa_cc_phys`) | done (`runs/jepa_ac_phys`) |
+| Differential probe, epochs 200 and 0 | done | done |
+| Pruning-rule choice | done: `null_cal_fwer` | fixed in advance: `null_cal_fwer` |
+| Graphs from the true data and the model, epochs 200 and 0 | done (inside the pruning comparison) | done |
+| Graph on unseen (validation) episodes | — | done, epoch 200 |
+| Rule check on fixed physics (`datasets/cc`) | **to do** | — |
+| 21-checkpoint training curve | **to do** | postponed |
+| Interchange interventions | **to do** | **to do** |
+
+## Method in one paragraph
+
+1. **Simulate** each environment with hidden physics drawn per episode, and render 128×128 frames.
+2. **Derive the expert graph** from the exact equations: the Jacobian of one transition, at each row's own physics, cut into strong / weak / absent tiers at a normalised effect of 0.1.
+3. **Train the JEPA** on pixels only: a ViT encoder, a transformer predictor that sees the last 5 latents and the actions [u(t−1), u(t)], an inverse model, and SIGReg.
+4. **Read the predicted change** with the *differential probe*. It is an MLP fitted on the encoder's real latent change z(t+1) − z(t), then frozen and applied to the predictor's change ẑ(t+1) − z(t). A target counts as testable only if the encoder's own change is readable (R² ≥ 0.5).
+5. **Score every edge**, from the true simulator inputs to the read-out change, with leave-one-covariate-out (LOCO) refits and shuffled decoys over 50 random episode half-splits.
+6. **Prune** with `null_cal_fwer`: an edge is kept only if it beats the largest edge statistic in every one of 20 shuffled-target repeats (max-T, exact permutation p ≤ 0.05).
+7. **Compare** with the expert graph: strong-graph F1, AUROC and false positives. The untrained (epoch-0) model gives the floor.
+
+Fixed before any result: frame skip, the 5-latent history, the [u(t−1), u(t)] action context, true-state edge inputs, the testable cut R² ≥ 0.5, the tier cut 0.1 and the 50 splits. For Acrobot the pruning rule (`null_cal_fwer`) and the differential probe were also fixed in advance, with no rule comparison.
+
+## Folder layout
+
+| Path | What it is |
+|---|---|
+| `BTP_REPORT.md` | The report: approach, environments, answer key, results, related work, limitations |
+| `cc_common.py` | Cart-pole constants, Euler step, episode → (inputs, targets) stacking, dataset loading |
+| `envs/` | Environment registry (`cartpole`, `acrobot`). Shared code picks the environment from the dataset's `metadata.json` (`"env"`; no key = cart-pole) |
+| `sim/` | Simulators: `cartpole.py`, `acrobot.py` (Spong arm + spring-driven distractor block) |
+| `configs/` | `causal_cartpole.yaml`, `causal_acrobot.yaml`: environment, physics ranges, episode mix, model and training settings |
+| `checks/` | Step 1: `verify_equations.py` (cart-pole; `--env acrobot` hands over to Acrobot), `verify_acrobot.py`. Writes the expert graph |
+| `expert_graph.py` | Hand-derived cart-pole graph (adjacency, initial tiers); used by the checks |
+| `datagen/` | Step 2: `generate.py` (datasets), `dataset.py` (training windows) |
+| `model/` | JEPA (`jepa.py`) and the SIGReg loss (`sigreg.py`) |
+| `train_cc.py` | Step 3: trains the JEPA for either environment |
+| `probing/` | Step 4: `extract.py` (latents, predictor output, true variables; cached), `fit_probes.py` (differential probe) |
+| `discovery/` | Steps 5–6: `edge_scores.py` (LOCO + decoys), `prune.py` (all pruning rules), `null_calibration.py` (shuffled-target repeats) |
+| `evaluate/compare.py` | Step 7: comparison with the expert graph, markdown tables, plots |
+| `run_all.py` | Steps 4–7 end to end: data baseline, one checkpoint, probe only, or the training curve |
+| `compare_pruning.py` | Cart-pole only: compares all pruning rules on the same scores (report §6) |
+| `diagnose_physics.py` | Cart-pole only: does the hidden physics confound the true-data graph? (report §7) |
+| `compare_pruning_phys.py` | Cart-pole only: every graph scored conditional on the episode physics (sensitivity analysis) |
+| `reports/`, `research_notes/` | Literature review behind report §9 (with source tags) and its four research notes |
+| `datasets/`, `runs/`, `results/`, `logs/` | Data, checkpoints and extraction caches, outputs, logs (all git-ignored) |
+
+## Setup
+
+Python 3.12 on Windows, PowerShell, from this folder. `requirements.txt` pins PyTorch 2.11 with CUDA 12.8, which the RTX 5090 needs.
+
 ```powershell
-$PY = ".\.venv\Scripts\python.exe"; $env:PYTHONUTF8 = "1"
-& $PY checks\verify_equations.py --vary-physics                                    # ~5 min CPU -> expert graph for cc_phys
-& $PY compare_pruning.py --data datasets/cc_phys --run-dir runs/jepa_cc            # ~1-1.5 h GPU -> pick a rule
-# optional: a JEPA trained on varied physics (~3.5 h GPU; resume with --resume <checkpoint>)
-& $PY train_cc.py --data datasets/cc_phys --save-dir runs/jepa_cc_phys
-& $PY run_all.py --data datasets/cc_phys --ckpt <run>/checkpoints/checkpoint_epoch0200.pt --prune <rule>
-& $PY run_all.py --data datasets/cc_phys --run-dir <run> --curve --splits 20 --prune <rule>
+uv venv .venv --python 3.12            # or: python -m venv .venv
+& .\.venv\Scripts\python.exe -m pip install -r requirements.txt
+$PY = ".\.venv\Scripts\python.exe"; $env:PYTHONUTF8 = "1"   # the scripts print Unicode
 ```
-Outputs:
-- `results/checks_cc_phys.json` and `results/expert_graph_final_cc_phys.json`
-- `results/pruning_comparison_cc_phys_<run>/report.md`
-- `results/<run>_cc_phys_diff_<rule>/…` and `results/data_baseline_cc_phys_<rule>.json`
 
-Two consequences of hidden physics:
-- **Imperfect baseline.** Even the true-data baseline can no longer reach R² = 1, so its recovery of the expert graph is no longer guaranteed.
-- **Old model is out-of-distribution.** `runs/jepa_cc` was trained on fixed physics, so on cc_phys it is out-of-distribution.
+- **CPU only:** set `$env:CUDA_VISIBLE_DEVICES = "-1"`. Never set it to `""`: PowerShell then deletes the variable, and the GPU is used anyway.
+- **GPU loss:** the RTX 5090 on this machine sometimes drops off the driver ("GPU is lost"). Kill the frozen Python process, reboot, and rerun the same command. Every long step is resumable.
+- The code is self-contained. The model architecture follows the `JEPA_control` cart-pole model, but nothing is imported from it.
 
-The plan is at `C:\Users\Administrator\.claude\plans\firstly-update-everything-according-humble-wombat.md`. This folder imports `JEPA_control` but does not modify it.
+## Run order
 
-## Original fixed-physics study (`datasets/cc`, `runs/jepa_cc`)
+Each command runs from this folder. Times are on the RTX 5090.
 
-Every command still works on `datasets/cc` and uses `results/expert_graph_final.json`. Use the repo's virtual env: `PY=../Evaluating-Causal-Metrics-on-World-Models/JEPA_control/.venv/Scripts/python.exe`. Set `PYTHONUTF8=1` on Windows, because the repo prints Unicode arrows.
+### Cart-pole, varied physics (main study)
 
-| step | command | time |
-|---|---|---|
-| 1 checks | `$PY checks/verify_equations.py` | ~2 min (done: 6/6 pass) |
-| 2 data | `$PY datagen/generate.py` | ~3 min (done: `datasets/cc`) |
-| 3 train | `$PY train_cc.py --data datasets/cc --save-dir runs/jepa_cc` | ~3.5 h on the RTX 5090 (62 s/epoch) |
-| 4–7 data baseline | `$PY run_all.py --data datasets/cc --data-baseline` | GPU minutes |
-| 4–7 final model | `$PY run_all.py --data datasets/cc --ckpt runs/jepa_cc/checkpoints/checkpoint_epoch0200.pt` | |
-| 4–7 random-init model | `$PY run_all.py --data datasets/cc --ckpt runs/jepa_cc/checkpoints/checkpoint_epoch0000.pt` | |
-| curve | `$PY run_all.py --data datasets/cc --run-dir runs/jepa_cc --curve --splits 20` | |
-
-Outputs:
-- `results/data_baseline.json`
-- `results/jepa_cc/epoch####/{results.json, edges.md, graphs.png}`
-- `results/jepa_cc/curve.{json,png}`
-
-## Varied-physics dataset `datasets/cc_phys` (2026-11-09)
-
-`python datagen/generate.py --vary-physics` draws each episode's physics uniformly from `physics_ranges` in the config. The physics is constant within an episode.
-
-| parameter | range | old fixed value |
-|---|---|---|
-| cart mass M | 0.5 – 2.0 kg | 1.0 |
-| pole mass m | 0.05 – 0.5 kg | 0.1 |
-| pole half-length l | 0.25 – 0.75 m (pole 0.5 – 1.5 m, drawn at its true length) | 0.5 |
-| gravity g | 4.9 – 14.7 m/s² | 9.8 |
-
-Same episode types, counts and seeds as `datasets/cc`. The LQR gain is recomputed per episode. Each episode stores `phys_M, phys_m, phys_l, phys_g` as HDF5 attrs, and `probing/extract.py` returns them per transition as `physics` (n, 4). Without the flag the generator reproduces `datasets/cc` exactly, which was verified on `cc_small`.
-
-The JEPA (`runs/jepa_cc`) was trained on fixed physics only, so on `cc_phys` it sees unfamiliar dynamics and pole lengths. The probe report includes change R² per third of each parameter's range (`R2_by_physics_tercile`).
 ```powershell
-& $PY run_all.py --data datasets/cc_phys --ckpt runs/jepa_cc/checkpoints/checkpoint_epoch0200.pt --probe-only --seeds 3
+& $PY checks\verify_equations.py --vary-physics                     # ~5 min CPU -> expert graph + checks
+& $PY datagen\generate.py --vary-physics                            # -> datasets/cc_phys
+& $PY -m discovery.null_calibration --data datasets/cc_phys --reps 20   # ~4-5 min per repeat
+& $PY train_cc.py --data datasets/cc_phys --save-dir runs/jepa_cc_phys  # ~3.5 h; --resume <ckpt> to continue
+& $PY run_all.py --data datasets/cc_phys --ckpt runs/jepa_cc_phys/checkpoints/checkpoint_epoch0200.pt --probe-only --seeds 3
+& $PY run_all.py --data datasets/cc_phys --ckpt runs/jepa_cc_phys/checkpoints/checkpoint_epoch0000.pt --probe-only --seeds 3
+& $PY compare_pruning.py --data datasets/cc_phys --run-dir runs/jepa_cc_phys   # all rules; data, noise, null and model graphs
+& $PY diagnose_physics.py --data datasets/cc_phys --run-dir runs/jepa_cc_phys
+& $PY compare_pruning_phys.py --data datasets/cc_phys --run-dir runs/jepa_cc_phys
 ```
-Output: `results/jepa_cc_cc_phys_diff_margin/epoch0200/probe.json`.
 
-`checks/verify_equations.py --vary-physics` runs the same six checks under the cc_phys policies:
-- **(a), (b)** Equations and energy are tested at random physics.
-- **(c)** The observability bar is R² > 0.99, because one linear fit cannot absorb a 1/(M+m) acceleration.
-- **(d), (e)** Every sampled transition is differentiated at its own episode's physics. The tiers are recomputed over that distribution, and the changes against the fixed-physics graph are listed.
-- **(f)** The Markov check passes when older history adds nothing once the physics is known. It also reports, as a diagnostic, how much older history helps when the physics is hidden. That is the information a 5-latent history could use to infer the physics.
+The cart-pole graphs in the report (true data, trained model, untrained model) are the `null_cal_fwer` rows of `compare_pruning.py`. The same graphs can be produced as stand-alone runs:
 
-## Differential probe only, and new pruning rules (2026-11-09)
-
-The same commands work for either dataset (see "Current run order" above). `compare_pruning.py` writes to `results/pruning_comparison_<data>_<run>/`. It takes the data_noisy noise level from the studied model's own predictor change R² at its last checkpoint, and compares the model's last checkpoint with epoch 0.
-
-Pruning rules (`discovery/prune.py`; all read the same per-split scores, all blind to the expert graph):
-
-| rule | keeps an edge if | source |
-|---|---|---|
-| margin (original) | LOCO beats the strongest shuffled decoy by log 1.5 in ≥ 70% of splits | Meinshausen & Bühlmann 2010; Barber & Candès 2015 |
-| fdr | per-split episode-clustered z-test of LOCO vs the strongest decoy; p-values combined across splits (2 × median); BH at q = 0.05 | Lei et al. 2018; Williamson et al. 2023; Meinshausen, Meier & Bühlmann 2009 |
-| min_effect | as fdr, but H0 is "explains ≤ 1% more target variance than a decoy" | minimum-relevant-effect test |
-| effect | normalised Jacobian of the full fit ≥ 0.1 (the expert's own "strong" unit and cut-off) and above every decoy's, in ≥ 70% of splits | expert tier rule (check e) |
-| effect_fdr | effect AND fdr | — |
-| knockoff | derandomised Gaussian model-X knockoffs, knockoff+ (q = 0.1), selected in ≥ 50% of splits | Candès et al. 2018; Ren, Wei & Candès 2023 |
-
-Why the rule matters here: θ and ω̄ are 98–99% predictable from the other inputs (even with open-loop forcing), so LOCO's unique information for edges out of θ and ω̄ is under 1% of target variance. The original log-ratio margin passes them on noise-free data only because the residual there is ~0. At the model's noise floor (held-out R² 0.93–0.98) the same edges fall below the margin.
-
-## Earlier design: three readout arms (2026-11-07, superseded)
-
-The question is whether, and how, the JEPA learns cart-pole's causal structure **during training**. The model's predicted change is read in three separate ways. Each arm trains its own MLP probe(s) (192 → 256 → 256 → out, SiLU, 40 epochs), only on **encoder** latents, cross-fitted by episode with the same 5 folds for every arm. The frozen probes then read the **predictor's** output. Each arm's results are reported separately: there is no primary arm and no cross-arm vote.
-
-| arm | probe(s) | predictor change Δd̂ |
-|---|---|---|
-| normal | S_N: z → (x, v̄, θ, ω̄) | S_N(ẑ_{t+1}) − S_N(z_t) |
-| differential | Q_D: z_{t+1} − z_t → Δd | Q_D(ẑ_{t+1} − z_t) |
-| hybrid | H_L: z → (v̄, ω̄); H_D: Δz → (Δv̄, Δω̄) | Δx = DT·v̄(ẑ_{t+1}), Δθ = DT·ω̄(ẑ_{t+1}); Δv̄, Δω̄ = H_D(ẑ_{t+1} − z_t) |
-
-- The hybrid's kinematic rows are exact: v̄_{t+1} = (x_{t+1} − x_t)/DT, so Δx = DT·v̄_{t+1}. This was checked on the data (max error 1.5e-8).
-- The edge-scoring inputs are the **true** simulator states plus u_t, u_{t−1}, u_{t−2} for every arm and checkpoint, so only the readout of the model's change varies. `--inputs linear` gives the old linear-probed inputs as a continuity row.
-- Scoring, pruning (log 1.5 margin, 70% stability) and the expert comparison are unchanged.
-- Action effects are a finite difference of each arm's own readout along d ẑ / d u.
-
-Criteria fixed in advance:
-- **Testable target:** encoder-change R² ≥ 0.5. Edges into untestable targets are untestable, not absent. F1 is also reported on testable edges only.
-- **Learned (per arm):** the epoch-200 predictor strong-graph AUROC is above that arm's epoch-0 floor, with no false-positive edges.
-- **Emergence epoch of an edge:** the first checkpoint from which it is kept at every later checkpoint.
-
-Run order (PowerShell, from this folder):
 ```powershell
-$PY = ".\.venv\Scripts\python.exe"; $env:PYTHONUTF8 = "1"
-$env:CUDA_VISIBLE_DEVICES = "-1"     # CPU while the GPU is unstable; never set it to ""
-& $PY run_all.py --data datasets/cc --ckpt runs/jepa_cc/checkpoints/checkpoint_epoch0200.pt --probe-only --seeds 3
-& $PY run_all.py --data datasets/cc --ckpt runs/jepa_cc/checkpoints/checkpoint_epoch0000.pt --probe-only --seeds 3
-& $PY run_all.py --data datasets/cc --ckpt runs/jepa_cc/checkpoints/checkpoint_epoch0200.pt
-& $PY run_all.py --data datasets/cc --ckpt runs/jepa_cc/checkpoints/checkpoint_epoch0000.pt
-& $PY run_all.py --data datasets/cc --run-dir runs/jepa_cc --curve --splits 20     # stable GPU only
+& $PY run_all.py --data datasets/cc_phys --data-baseline --prune null_cal_fwer
+& $PY run_all.py --data datasets/cc_phys --ckpt runs/jepa_cc_phys/checkpoints/checkpoint_epoch0200.pt --prune null_cal_fwer
 ```
-Outputs:
-- `results/jepa_cc_arms/epoch####/<arm>/{results.json, edges.md, graphs.png, probe.json}` and `epoch####/summary.md`
-- curve: `results/jepa_cc_arms/curve_s20/…`, `curve_<arm>.json` (including emergence epochs) and `curve.png`
 
-Every run is **resumable**. Extractions are cached in `runs/jepa_cc/extract/` (about 100 MB each), and a finished (checkpoint, arm) pair is skipped. After a GPU loss, kill the frozen Python process, reboot and rerun the same command. The old linear readouts are still available with `--readout state|delta`.
+Still to do:
 
-## Changes from the plan made during implementation
+```powershell
+# rule check on fixed physics: needs its own null first
+& $PY -m discovery.null_calibration --data datasets/cc --reps 20
+& $PY compare_pruning.py --data datasets/cc --run-dir runs/jepa_cc
+# 21-checkpoint curve: the null must use the same split count as the curve
+& $PY -m discovery.null_calibration --data datasets/cc_phys --reps 20 --splits 20
+& $PY run_all.py --data datasets/cc_phys --run-dir runs/jepa_cc_phys --curve --splits 20 --prune null_cal_fwer
+```
 
-1. **Expert tiers are measured, not hand-assigned.** The edge structure from the hand derivation matches the exact Jacobian of the simulator (check d). The strong/weak split comes from measured effect sizes (check e): strong means a normalised effect ≥ 0.1. Six edges changed tier. For example, θ → Δv̄ is weak because the pole (0.1 kg) is much lighter than the cart (1 kg). Final graph: 10 strong, 7 weak, 11 absent (`results/expert_graph_final.json`).
-2. **Edge weight = leave-one-covariate-out (LOCO), not permutation importance.** Permutation importance gave absent inputs that are correlated with a real cause (v̄ → Δθ, via ω̄) more weight than the decoys. LOCO refits without the input and measures log(held-out MSE without / with). All drop-one variants of a split are trained as one batched network from shared initial weights.
-3. **Pruning margin.** An edge is kept if it beats the strongest decoy by log 1.5 (removing it makes held-out error 50% worse than removing a decoy) in at least 70% of 50 half-splits. The margin was fixed in advance, not tuned on the expert graph.
-4. **Data patches.** Frames use area-averaged resizing (OpenCV is missing, and the repo's fallback picks single pixels), and the LQR gain is computed for 0.04 s steps.
+### Acrobot
 
-## Status (2026-11-05)
+```powershell
+& $PY checks\verify_equations.py --env acrobot --vary-physics       # -> expert graph + checks
+& $PY datagen\generate.py --env acrobot --vary-physics              # ~35 min -> datasets/ac_phys
+& $PY -m discovery.null_calibration --data datasets/ac_phys --reps 20
+& $PY run_all.py --data datasets/ac_phys --data-baseline --prune null_cal_fwer
+& $PY train_cc.py --data datasets/ac_phys --config configs/causal_acrobot.yaml --save-dir runs/jepa_ac_phys   # ~3.5 h
+& $PY run_all.py --data datasets/ac_phys --ckpt runs/jepa_ac_phys/checkpoints/checkpoint_epoch0200.pt --probe-only --seeds 3
+& $PY run_all.py --data datasets/ac_phys --ckpt runs/jepa_ac_phys/checkpoints/checkpoint_epoch0000.pt --probe-only --seeds 3
+& $PY run_all.py --data datasets/ac_phys --ckpt runs/jepa_ac_phys/checkpoints/checkpoint_epoch0200.pt --prune null_cal_fwer
+& $PY run_all.py --data datasets/ac_phys --ckpt runs/jepa_ac_phys/checkpoints/checkpoint_epoch0000.pt --prune null_cal_fwer
+# unseen episodes: the validation split needs its own null (fewer rows)
+& $PY -m discovery.null_calibration --data datasets/ac_phys --reps 20 --split val
+& $PY run_all.py --data datasets/ac_phys --data-baseline --prune null_cal_fwer --split val
+& $PY run_all.py --data datasets/ac_phys --ckpt runs/jepa_ac_phys/checkpoints/checkpoint_epoch0200.pt --prune null_cal_fwer --split val
+```
 
-- Steps 1–2 are done, and the full pipeline was smoke-tested on `datasets/cc_small`. There, the data baseline recovers the strong expert graph exactly (F1 = 1, AUROC = 1).
-- Training stopped after epoch 1: the GPU dropped off the driver (`nvlddmkm` event 153, "GPU is lost"). A reboot is needed before step 3.
+### Cart-pole, fixed physics (first model)
+
+`datasets/cc` and `runs/jepa_cc` are the original fixed-physics data and model: `datagen\generate.py` without `--vary-physics`, and `checks\verify_equations.py` without the flag. Report §7 uses this model's probe ("trained on fixed physics"). Every command above also works with `--data datasets/cc`. Without `--vary-physics` the generator reproduces `datasets/cc` exactly.
+
+### Smoke test
+
+`datagen\generate.py --small` writes a tiny cart-pole dataset (`datasets/cc_small`); `datagen\generate.py --env acrobot --vary-physics --small` writes `datasets/ac_phys_small`. Train it for one epoch with `train_cc.py ... --epochs 1`, then run `run_all.py` on it. This exercises the whole pipeline in minutes.
+
+## Important flags and gotchas
+
+- **Always pass `--prune null_cal_fwer`.** `run_all.py` still defaults to `margin`, the original rule, and the rule name is part of every output path.
+- **The null must match the rows and the split count.** `null_cal*` rules read `results/null_calibration_<data>[_<split>]/rep###_s<splits>.json`. A run with `--splits 20` or `--split val` needs nulls made with the same option.
+- **Batch-norm recalibration (Acrobot).** The Acrobot encoder's batch-norm running statistics go stale, which made eval-mode losses meaningless (val 15 instead of 0.45). For Acrobot (`RECALIBRATE_BN` in `envs/acrobot.py`), training and extraction recompute them from 200 training batches before every evaluation. Cart-pole is unaffected. Extraction cache names do not record this. Delete any Acrobot cache made before the fix (2026-11-11 15:09); the one known stale cache is already renamed `*.stale_pre_bnfix`.
+- **Caches.** Extractions are cached in `runs/<run>/extract/<data>[_<split>]_<checkpoint>.npz` (~100 MB each), null repeats and comparison scores in `results/`. Finished checkpoints are skipped on a rerun.
+- **Training-time probe.** `train_cc.py` logs a ridge probe (`probe_r2_x_xdot_theta_thetadot`) as a rough progress signal. For Acrobot it reads the raw 6-d state with unwrapped angles, so it is not a result.
+- **Acrobot angles** enter edge scoring as a (sin θ, cos θ) pair. LOCO drops the pair, and the decoys shuffle it, as one node.
+
+## Outputs
+
+`<tag>` is `_<dataset name>` (empty for `datasets/cc`) plus `_<split>` when the split is not `train`.
+
+| File | Contents | Report |
+|---|---|---|
+| `results/checks<_cc_phys or _ac_phys>.json` | The six equation checks | §3 |
+| `results/expert_graph_final<_cc_phys or _ac_phys>.json` | Expert graph with tiers and effects (no suffix = `datasets/cc`) | §3 |
+| `datasets/<data>/summary.json` | Episode and transition counts, physics ranges | §2 |
+| `runs/<run>/history.json`, `config.yaml`, `checkpoints/` | Training losses per epoch, 21 checkpoints (every 10 epochs) | §4 |
+| `results/<run><tag>_diff_<rule>/epoch####/probe.json` | Differential-probe R² (encoder and predictor, seed spread) | §7, §8 |
+| `results/<run><tag>_diff_<rule>/epoch####/{summary.md, edges.md, results.json}` | Graph from one checkpoint: metrics, per-edge table, full scores | §8 |
+| `results/data_baseline<tag>_<rule>.json` | Graph from the true targets | §8 |
+| `results/null_calibration_<data>[_<split>]/` | Shuffled-target null repeats | §6 |
+| `results/pruning_comparison_cc_phys_jepa_cc_phys/report.md` | All pruning rules on all validation and model graphs | §6, §7 |
+| `results/physics_conditioning_cc_phys/report.md` | Hidden-physics confounding of the data graph | §7 |
+| `results/pruning_comparison_phys_cc_phys_jepa_cc_phys/report.md` | Physics-conditioned rule comparison | §6 |
+
+The report's cart-pole probe table reads `results/jepa_cc_arms/epoch0200/differential/probe.json` (fixed physics; this folder was named under the earlier three-readout design), `results/jepa_cc_cc_phys_diff_margin/epoch0200/probe.json` (fixed-physics model on varied physics) and `results/jepa_cc_phys_cc_phys_diff_margin/epoch0200/probe.json`. The probe does not depend on the pruning rule, so `_margin` in these names does not matter.
+
+## Pruning rules (`discovery/prune.py`)
+
+Every rule reads the same per-split scores, and none sees the expert graph.
+
+| Rule | Keeps an edge if | Source |
+|---|---|---|
+| `margin` | LOCO beats the strongest shuffled decoy by log 1.5 in ≥ 70% of splits | Meinshausen & Bühlmann 2010; Barber & Candès 2015 |
+| `fdr` | Episode-clustered z-test of LOCO vs the strongest decoy per split, p-values combined across splits (2 × median), BH at q = 0.05 | Lei et al. 2018; Meinshausen, Meier & Bühlmann 2009 |
+| `min_effect` | As `fdr`, with H0 "explains ≤ 1% more target variance than a decoy" | Minimum-relevant-effect test |
+| `effect` | Normalised Jacobian of the full fit ≥ 0.1 and above every decoy's, in ≥ 70% of splits | The expert's own tier rule |
+| `effect_fdr` | `effect` and `fdr` | — |
+| `knockoff` | Derandomised Gaussian model-X knockoffs, knockoff+ at q = 0.1, selected in ≥ 50% of splits | Candès et al. 2018; Ren, Wei & Candès 2023 |
+| `null_cal` | The `min_effect` statistic beats the same edge's statistic in all 20 shuffled-target repeats (p = 1/21 ≤ 0.05) | Phipson & Smyth 2010 |
+| **`null_cal_fwer`** (chosen) | As `null_cal`, but against the largest statistic over all edges in each repeat (max-T): 5% false positives per graph | Westfall & Young 1993 |
+| `null_cal_vif_fwer` | `null_cal_fwer` with the 1% margin scaled by (1 − R²) of the input on the others (collinearity) | Sensitivity analysis only |
+
+The rule was chosen on graphs that do not depend on the model's quality: the true data, the true data with noise matched to the model, shuffled targets, and the untrained model. Report §6 has the comparison.

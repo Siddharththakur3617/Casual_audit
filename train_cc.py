@@ -26,6 +26,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 import yaml
+from torch.utils.data import DataLoader
 
 from cc_common import HERE
 from datagen.dataset import make_loaders
@@ -95,6 +96,55 @@ def ridge_r2(z_tr, y_tr, z_te, y_te, ridge=1e-3):
     return 1 - ((p - y_te) ** 2).sum(0) / ((y_te - y_te.mean(0)) ** 2).sum(0)
 
 
+BN_RECAL_BATCHES = 200
+
+
+def loss_cfg(tc):
+    """Loss settings from a training config block (as used by losses())."""
+    cfg = {k: float(tc.get(k, 0.0)) for k in ('lambda_fwd', 'lambda_inverse', 'lambda_rollout',
+                                              'lambda_sigreg')}
+    cfg.update(history=int(tc['history']), rollout_steps=int(tc['rollout_steps']),
+               sigreg_num_slices=int(tc.get('sigreg_num_slices', 128)),
+               sigreg_num_points=int(tc.get('sigreg_num_points', 17)))
+    return cfg
+
+
+def needs_bn_recal(data_dir):
+    """Environments whose BatchNorm running statistics go stale during training (acrobot: the
+    encoder projector's running mean ends up ~5 SD off the batch mean, so eval-mode latents are
+    shifted and every eval-mode number is wrong). Cart-pole keeps the old behaviour."""
+    import envs
+    return bool(getattr(envs.get_env(envs.env_name_of(data_dir)), 'RECALIBRATE_BN', False))
+
+
+@torch.no_grad()
+def recalibrate_bn(model, dataset, device, cfg, batch_size, n_batches=BN_RECAL_BATCHES, seed=0):
+    """Recompute every BatchNorm's running mean/var as the plain average of the batch statistics
+    over n_batches training windows ("precise BN"), with the weights frozen and the training forward
+    pass (losses()), so the statistics are the ones the model was trained under. Deterministic
+    (own sampler seed and RNG), and it leaves the caller's RNG state and train/eval mode unchanged."""
+    bns = [m for m in model.modules() if isinstance(m, torch.nn.modules.batchnorm._BatchNorm)]
+    if not bns:
+        return
+    was_training, momenta = model.training, [m.momentum for m in bns]
+    for m in bns:
+        m.reset_running_stats()
+        m.momentum = None                     # cumulative average instead of an EMA
+    loader = DataLoader(dataset, batch_size=batch_size, shuffle=True, drop_last=True,
+                        generator=torch.Generator().manual_seed(seed))
+    model.train()
+    cuda = [torch.cuda.current_device()] if device.type == 'cuda' else []
+    with torch.random.fork_rng(devices=cuda):
+        torch.manual_seed(seed)
+        for i, batch in enumerate(loader):
+            if i >= n_batches:
+                break
+            losses(model, batch, device, cfg)
+    for m, mo in zip(bns, momenta):
+        m.momentum = mo
+    model.train(was_training)
+
+
 @torch.no_grad()
 def run_eval(model, loader, device, cfg, collect=False, max_batches=None):
     model.eval()
@@ -148,11 +198,10 @@ def main():
     model = JEPA(mc).to(device)
     print(f'[model] {sum(p.numel() for p in model.parameters()):,} params, history={hist}, '
           f'action_context_dim={model.action_context_dim}, device={device}')
-    cfg = {k: float(tc.get(k, 0.0)) for k in ('lambda_fwd', 'lambda_inverse', 'lambda_rollout',
-                                              'lambda_sigreg')}
-    cfg.update(history=hist, rollout_steps=steps,
-               sigreg_num_slices=int(tc.get('sigreg_num_slices', 128)),
-               sigreg_num_points=int(tc.get('sigreg_num_points', 17)))
+    cfg = loss_cfg(tc)
+    recal = needs_bn_recal(args.data)
+    if recal:
+        print(f'[bn] recalibrating BatchNorm statistics on {BN_RECAL_BATCHES} train batches before each eval')
 
     opt = torch.optim.AdamW(model.parameters(), lr=float(tc['lr']),
                             weight_decay=float(tc.get('weight_decay', 1e-3)))
@@ -171,7 +220,8 @@ def main():
     def ckpt(epoch, val_loss):
         return {'epoch': epoch, 'model': model.state_dict(), 'optimizer': opt.state_dict(),
                 'scheduler': sched.state_dict(), 'model_config': mc, 'training_config': tc,
-                'action_scale': action_scale, 'val_loss': val_loss, 'best_val': best}
+                'action_scale': action_scale, 'val_loss': val_loss, 'best_val': best,
+                'bn_recal': recal}
 
     if args.resume:
         ck = torch.load(args.resume, map_location=device, weights_only=False)
@@ -180,6 +230,9 @@ def main():
         start, best = int(ck['epoch']) + 1, float(ck.get('best_val', float('inf')))
         hp = out / 'history.json'
         history = json.loads(hp.read_text()) if hp.exists() else []
+        if recal and not ck.get('bn_recal', False):
+            best = float('inf')     # earlier val losses used stale BN statistics: not comparable
+            print('[resume] earlier val losses used stale BN statistics; best-checkpoint tracking restarts')
         print(f'[resume] from epoch {ck["epoch"]}')
     else:
         torch.save(ckpt(0, float('nan')), out / 'checkpoints' / 'checkpoint_epoch0000.pt')
@@ -199,9 +252,13 @@ def main():
             tot += b * parts; n += b
         train = (tot / n).cpu().numpy()
         probe = epoch % int(tc.get('probe_every', 10)) == 0 or epoch == 1
+        if recal:
+            recalibrate_bn(model, loaders['train'].dataset, device, cfg, int(tc['batch_size']))
         val, zv, yv = run_eval(model, loaders['val'], device, cfg, collect=probe)
         row = {'epoch': epoch, 'lr': float(opt.param_groups[0]['lr']),
                'train': dict(zip(names, map(float, train))), 'val': dict(zip(names, map(float, val)))}
+        if recal:
+            row['bn_recal'] = True
         msg = (f'[epoch {epoch:3d}/{epochs}] ' + ' '.join(f'{k}={v:.4f}' for k, v in row['train'].items())
                + ' | val ' + ' '.join(f'{k}={v:.4f}' for k, v in row['val'].items()))
         if probe:

@@ -19,18 +19,30 @@ import numpy as np
 import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from cc_common import PHYS, T_MIN, episode_variables  # noqa: E402
-
-PHYS_KEYS = ('M', 'm', 'l', 'g')
+import envs  # noqa: E402
+from cc_common import T_MIN  # noqa: E402
 from model.jepa import JEPA  # noqa: E402
+import train_cc  # noqa: E402
 
 
-def load_model(ckpt_path, device):
+def load_model(ckpt_path, device, data_dir=None):
+    """Model in eval mode. For environments that need it (train_cc.needs_bn_recal), the BatchNorm
+    running statistics are recomputed on the dataset's training windows first, whatever the
+    checkpoint stored, so every checkpoint (epoch 0 included) is read the same way."""
     ck = torch.load(ckpt_path, map_location=device, weights_only=False)
     model = JEPA(dict(ck['model_config'])).to(device)
     model.load_state_dict(ck['model'])
+    action_scale = float(ck.get('action_scale', 10.0))
+    if data_dir is not None and train_cc.needs_bn_recal(data_dir):
+        from datagen.dataset import WindowDataset
+        tc = ck['training_config']
+        ds = WindowDataset(Path(data_dir) / 'train.hdf5', int(tc['horizon']),
+                           int(ck['model_config']['action_context_dim']), action_scale)
+        train_cc.recalibrate_bn(model, ds, device, train_cc.loss_cfg(tc), int(tc['batch_size']))
+        del ds
+        print(f'  [bn] recalibrated BatchNorm statistics ({train_cc.BN_RECAL_BATCHES} train batches)')
     model.eval()
-    return model, float(ck.get('action_scale', 10.0)), int(ck.get('epoch', -1))
+    return model, action_scale, int(ck.get('epoch', -1))
 
 
 def contexts(u_scaled, ctx):
@@ -87,12 +99,13 @@ def history_sensitivity(model, zh, useq, n_probe=8):
 
 
 def extract(ckpt_path, data_dir, split='train', device='cuda', out=None):
+    env = envs.use_data(data_dir)
     device = torch.device(device if torch.cuda.is_available() else 'cpu')
-    model, action_scale, epoch = load_model(ckpt_path, device)
+    model, action_scale, epoch = load_model(ckpt_path, device, data_dir)
     hist, ctx = model.history_size, model.action_context_dim
     assert T_MIN >= hist and T_MIN >= hist + ctx - 2, 'T_MIN too small for this model'
     image_size = int(model.cfg.get('image_size', 128))
-    keys = ('z', 'zhat_next', 'z_next', 'inputs', 'targets', 'xdot', 'thetadot',
+    keys = ('z', 'zhat_next', 'z_next', 'inputs', 'targets') + tuple(env.EXTRA_KEYS) + (
             'episode', 't', 'dzhat_du', 'hist_sens', 'physics')
     acc = {k: [] for k in keys}
     types = []
@@ -101,7 +114,7 @@ def extract(ckpt_path, data_dir, split='train', device='cuda', out=None):
         for e, key in enumerate(sorted(grp.keys(), key=int)):
             ep = grp[key]
             states, actions = ep['states'][:], ep['actions'][:].reshape(-1)
-            v = episode_variables(states, actions)
+            v = env.episode_variables(states, actions)
             if v is None:
                 continue
             ts = v['t']
@@ -117,10 +130,10 @@ def extract(ckpt_path, data_dir, split='train', device='cuda', out=None):
             acc['z_next'].append(zf[ts + 1].cpu().numpy())
             acc['dzhat_du'].append(dzdu.cpu().numpy().astype(np.float32))
             acc['hist_sens'].append(history_sensitivity(model, zh, useq).cpu().numpy())
-            for k in ('inputs', 'targets', 'xdot', 'thetadot', 't'):
+            for k in ('inputs', 'targets', 't') + tuple(env.EXTRA_KEYS):
                 acc[k].append(v[k])
             acc['episode'].append(np.full(len(ts), e))
-            phys = [float(ep.attrs.get(f'phys_{k}', PHYS[k])) for k in PHYS_KEYS]   # (M, m, l, g)
+            phys = [float(ep.attrs.get(f'phys_{k}', env.PHYS[k])) for k in env.PHYS_KEYS]   # e.g. (M, m, l, g)
             acc['physics'].append(np.tile(np.asarray(phys, np.float32), (len(ts), 1)))
             tt = ep.attrs.get('trajectory_type', 'unknown')
             types += [tt.decode() if isinstance(tt, bytes) else str(tt)] * len(ts)

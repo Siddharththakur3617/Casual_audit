@@ -1,0 +1,415 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Cart-pole Learning Curve</title>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/3.9.1/chart.min.js"></script>
+    <style>
+        :root {
+            --bg: #fafaf8;
+            --fg: #1a1a18;
+            --accent: #2563eb;
+            --accent-light: #dbeafe;
+            --border: #e5e5e3;
+            --text-secondary: #666;
+        }
+
+        @media (prefers-color-scheme: dark) {
+            :root:not([data-theme="light"]) {
+                --bg: #1a1a18;
+                --fg: #fafaf8;
+                --accent: #60a5fa;
+                --accent-light: #1e3a8a;
+                --border: #333;
+                --text-secondary: #999;
+                color-scheme: dark;
+            }
+        }
+
+        :root[data-theme="dark"] {
+            --bg: #1a1a18;
+            --fg: #fafaf8;
+            --accent: #60a5fa;
+            --accent-light: #1e3a8a;
+            --border: #333;
+            --text-secondary: #999;
+            color-scheme: dark;
+        }
+
+        * { box-sizing: border-box; }
+
+        body {
+            background: var(--bg);
+            color: var(--fg);
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Helvetica Neue", sans-serif;
+            line-height: 1.6;
+            margin: 0;
+            padding: 2rem max(2rem, env(safe-area-inset-right, 0px)) 2rem max(2rem, env(safe-area-inset-left, 0px));
+        }
+
+        h1 {
+            font-size: 2rem;
+            font-weight: 700;
+            margin: 0 0 0.5rem;
+            text-wrap: balance;
+        }
+
+        .subtitle {
+            color: var(--text-secondary);
+            font-size: 1.1rem;
+            margin: 0 0 2rem;
+        }
+
+        .section {
+            background: transparent;
+            padding: 0;
+            margin-bottom: 3rem;
+        }
+
+        .chart-title {
+            font-size: 1.2rem;
+            font-weight: 600;
+            margin: 0 0 1rem;
+            color: var(--fg);
+        }
+
+        .chart-container {
+            position: relative;
+            height: 320px;
+            background: var(--bg);
+            border: 1px solid var(--border);
+            border-radius: 8px;
+            padding: 1.5rem;
+            margin-bottom: 2rem;
+        }
+
+        .grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(400px, 1fr));
+            gap: 2rem;
+            margin-bottom: 3rem;
+        }
+
+        .finding {
+            background: var(--accent-light);
+            border-left: 4px solid var(--accent);
+            padding: 1.5rem;
+            border-radius: 4px;
+            margin-bottom: 1rem;
+        }
+
+        .finding h3 {
+            margin: 0 0 0.5rem;
+            font-size: 1.1rem;
+            color: var(--fg);
+        }
+
+        .finding p {
+            margin: 0;
+            color: var(--text-secondary);
+        }
+
+        .stats {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+            gap: 1.5rem;
+            margin-bottom: 2rem;
+        }
+
+        .stat-box {
+            border: 1px solid var(--border);
+            border-radius: 6px;
+            padding: 1.25rem;
+            text-align: center;
+        }
+
+        .stat-label {
+            font-size: 0.85rem;
+            color: var(--text-secondary);
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+            margin-bottom: 0.5rem;
+        }
+
+        .stat-value {
+            font-size: 1.8rem;
+            font-weight: 700;
+            color: var(--accent);
+        }
+
+        .legend {
+            display: flex;
+            gap: 1.5rem;
+            margin-top: 1rem;
+            flex-wrap: wrap;
+            font-size: 0.9rem;
+        }
+
+        .legend-item {
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+        }
+
+        .legend-dot {
+            width: 12px;
+            height: 12px;
+            border-radius: 50%;
+        }
+
+        @media (max-width: 600px) {
+            h1 { font-size: 1.5rem; }
+            .grid { grid-template-columns: 1fr; }
+            .chart-container { height: 280px; }
+        }
+    </style>
+</head>
+<body>
+    <h1>Cart-pole Causal Structure Learning Curve</h1>
+    <p class="subtitle">21-checkpoint trajectory through 200 epochs of JEPA training with varied physics</p>
+
+    <div class="stats">
+        <div class="stat-box">
+            <div class="stat-label">False positives reach 0</div>
+            <div class="stat-value">epoch 160</div>
+        </div>
+        <div class="stat-box">
+            <div class="stat-label">Peak F1 (Strong)</div>
+            <div class="stat-value">0.75</div>
+        </div>
+        <div class="stat-box">
+            <div class="stat-label">Peak AUROC</div>
+            <div class="stat-value">0.94</div>
+        </div>
+        <div class="stat-box">
+            <div class="stat-label">Final False Positives</div>
+            <div class="stat-value">0</div>
+        </div>
+    </div>
+
+    <div class="grid">
+        <div class="section">
+            <h2 class="chart-title">F1 Score (Strong Edges)</h2>
+            <div class="chart-container">
+                <canvas id="f1Chart"></canvas>
+            </div>
+            <div class="legend">
+                <div class="legend-item">
+                    <div class="legend-dot" style="background: #2563eb;"></div>
+                    <span>Untrained (epoch 0) = 0.00</span>
+                </div>
+            </div>
+        </div>
+
+        <div class="section">
+            <h2 class="chart-title">Edges Kept (null_cal_fwer)</h2>
+            <div class="chart-container">
+                <canvas id="edgesChart"></canvas>
+            </div>
+            <div class="legend">
+                <div class="legend-item">
+                    <div class="legend-dot" style="background: #ec4899;"></div>
+                    <span>Predicted edges from model</span>
+                </div>
+            </div>
+        </div>
+
+        <div class="section">
+            <h2 class="chart-title">AUROC (Ranking Quality)</h2>
+            <div class="chart-container">
+                <canvas id="aurocChart"></canvas>
+            </div>
+            <div class="legend">
+                <div class="legend-item">
+                    <div class="legend-dot" style="background: #f59e0b;"></div>
+                    <span>Discriminative power</span>
+                </div>
+            </div>
+        </div>
+
+        <div class="section">
+            <h2 class="chart-title">False Positives</h2>
+            <div class="chart-container">
+                <canvas id="fpChart"></canvas>
+            </div>
+            <div class="legend">
+                <div class="legend-item">
+                    <div class="legend-dot" style="background: #ef4444;"></div>
+                    <span>Spurious edges kept</span>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <div class="section">
+        <h2 style="font-size: 1.3rem; font-weight: 600; margin-bottom: 1.5rem;">Key Findings</h2>
+
+        <div class="finding">
+            <h3>Structure sharpens between epochs 100 and 160</h3>
+            <p>The predictor's strong-edge AUROC rises from 0.66 (epoch 110) to 0.87 (epoch 150) and 0.90 (epoch 160). Before epoch 100 it sits near chance (0.45–0.62) and keeps 13–15 edges with 6–7 false positives. This is read by eye; the per-edge emergence epoch from the pre-set rule (first checkpoint kept at every later one) has not been computed yet.</p>
+        </div>
+
+        <div class="finding">
+            <h3>F1 stabilizes late (epochs 150–200)</h3>
+            <p>F1 is noisy in early training (0.45–0.61) because the model keeps many edges. After epoch 150, it stabilizes around 0.67–0.75. The untrained (epoch 0) predictor keeps 0 edges—it scores randomly.</p>
+        </div>
+
+        <div class="finding">
+            <h3>False positives fall to zero</h3>
+            <p>False positives decline from 7 (epoch 10) to 3 (epoch 140), 1 (epoch 150) and 0 from epoch 160 onward, while the number of kept edges falls from 14 to 5. The graph gets smaller and cleaner, not larger.</p>
+        </div>
+
+        <div class="finding">
+            <h3>Only part of the strong graph is recovered</h3>
+            <p>From epoch 160 on, the model keeps 5–7 edges, all true, out of 10 strong edges (F1 0.67–0.75). At 50 splits the missed edges were the pole-angle ones (θ→Δv̄, θ→Δθ, θ→Δω̄, ω̄→Δθ), which the method cannot separate because θ and ω̄ are highly collinear. Which edges are missed at each epoch of this 20-split curve is in each epoch's edges.md.</p>
+        </div>
+
+        <div class="finding">
+            <h3>AUROC plateaus at about 0.92–0.94</h3>
+            <p>AUROC peaks at 0.936 (epoch 180) and stays at 0.92–0.93 through epoch 200. F1 is flat at 0.67–0.75 over the same range, so F1 differences between late epochs (for example 0.75 at epoch 180 versus 0.67 at epoch 200) are one or two edges and should not be over-read. These are single-run results with one training seed.</p>
+        </div>
+    </div>
+
+    <script>
+        const data = [
+            { epoch: 0, f1: 0.000, edges: 0, auroc: 0.509, fp: 0 },
+            { epoch: 10, f1: 0.522, edges: 14, auroc: 0.445, fp: 7 },
+            { epoch: 20, f1: 0.522, edges: 14, auroc: 0.518, fp: 7 },
+            { epoch: 30, f1: 0.609, edges: 13, auroc: 0.545, fp: 6 },
+            { epoch: 40, f1: 0.455, edges: 13, auroc: 0.555, fp: 7 },
+            { epoch: 50, f1: 0.583, edges: 15, auroc: 0.491, fp: 7 },
+            { epoch: 60, f1: 0.609, edges: 14, auroc: 0.618, fp: 6 },
+            { epoch: 70, f1: 0.522, edges: 14, auroc: 0.582, fp: 7 },
+            { epoch: 80, f1: 0.609, edges: 14, auroc: 0.609, fp: 6 },
+            { epoch: 90, f1: 0.583, edges: 14, auroc: 0.545, fp: 7 },
+            { epoch: 100, f1: 0.696, edges: 14, auroc: 0.691, fp: 5 },
+            { epoch: 110, f1: 0.636, edges: 13, auroc: 0.664, fp: 5 },
+            { epoch: 120, f1: 0.600, edges: 11, auroc: 0.673, fp: 4 },
+            { epoch: 130, f1: 0.667, edges: 12, auroc: 0.782, fp: 4 },
+            { epoch: 140, f1: 0.632, edges: 10, auroc: 0.791, fp: 3 },
+            { epoch: 150, f1: 0.706, edges: 8, auroc: 0.873, fp: 1 },
+            { epoch: 160, f1: 0.667, edges: 5, auroc: 0.900, fp: 0 },
+            { epoch: 170, f1: 0.750, edges: 7, auroc: 0.873, fp: 0 },
+            { epoch: 180, f1: 0.750, edges: 6, auroc: 0.936, fp: 0 },
+            { epoch: 190, f1: 0.667, edges: 5, auroc: 0.918, fp: 0 },
+            { epoch: 200, f1: 0.667, edges: 5, auroc: 0.927, fp: 0 }
+        ];
+
+        const chartConfig = {
+            type: 'line',
+            options: {
+                responsive: true,
+                maintainAspectRatio: false,
+                plugins: {
+                    legend: { display: false }
+                },
+                scales: {
+                    y: {
+                        beginAtZero: true,
+                        max: 1.0,
+                        ticks: { stepSize: 0.2 }
+                    }
+                }
+            }
+        };
+
+        // F1 Chart
+        new Chart(document.getElementById('f1Chart'), {
+            ...chartConfig,
+            data: {
+                labels: data.map(d => d.epoch),
+                datasets: [{
+                    label: 'F1 Score',
+                    data: data.map(d => d.f1),
+                    borderColor: '#2563eb',
+                    backgroundColor: 'rgba(37, 99, 235, 0.05)',
+                    borderWidth: 2,
+                    tension: 0.3,
+                    pointRadius: 3,
+                    pointBackgroundColor: '#2563eb',
+                    fill: true
+                }]
+            }
+        });
+
+        // Edges Chart
+        new Chart(document.getElementById('edgesChart'), {
+            type: 'line',
+            data: {
+                labels: data.map(d => d.epoch),
+                datasets: [{
+                    label: 'Edges Kept',
+                    data: data.map(d => d.edges),
+                    borderColor: '#ec4899',
+                    backgroundColor: 'rgba(236, 72, 153, 0.05)',
+                    borderWidth: 2,
+                    tension: 0.3,
+                    pointRadius: 3,
+                    pointBackgroundColor: '#ec4899',
+                    fill: true
+                }]
+            },
+            options: {
+                ...chartConfig.options,
+                scales: {
+                    y: {
+                        beginAtZero: true,
+                        max: 16,
+                        ticks: { stepSize: 2 }
+                    }
+                }
+            }
+        });
+
+        // AUROC Chart
+        new Chart(document.getElementById('aurocChart'), {
+            type: 'line',
+            data: {
+                labels: data.map(d => d.epoch),
+                datasets: [{
+                    label: 'AUROC',
+                    data: data.map(d => d.auroc),
+                    borderColor: '#f59e0b',
+                    backgroundColor: 'rgba(245, 158, 11, 0.05)',
+                    borderWidth: 2,
+                    tension: 0.3,
+                    pointRadius: 3,
+                    pointBackgroundColor: '#f59e0b',
+                    fill: true
+                }]
+            },
+            options: chartConfig.options
+        });
+
+        // False Positives Chart
+        new Chart(document.getElementById('fpChart'), {
+            type: 'line',
+            data: {
+                labels: data.map(d => d.epoch),
+                datasets: [{
+                    label: 'False Positives',
+                    data: data.map(d => d.fp),
+                    borderColor: '#ef4444',
+                    backgroundColor: 'rgba(239, 68, 68, 0.05)',
+                    borderWidth: 2,
+                    tension: 0.3,
+                    pointRadius: 3,
+                    pointBackgroundColor: '#ef4444',
+                    fill: true
+                }]
+            },
+            options: {
+                ...chartConfig.options,
+                scales: {
+                    y: {
+                        beginAtZero: true,
+                        max: 8,
+                        ticks: { stepSize: 1 }
+                    }
+                }
+            }
+        });
+    </script>
+</body>
+</html>

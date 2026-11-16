@@ -29,13 +29,16 @@ def folds(episode, k=N_FOLDS, seed=0):
     return [np.isin(episode, part) for part in np.array_split(ids, k)]
 
 
-def mlp_cross_fit(z, y, episode, hidden=256, epochs=40, batch=512, lr=1e-3, seed=0, eval_sets=None):
+def mlp_cross_fit(z, y, episode, hidden=256, epochs=40, batch=512, lr=1e-3, seed=0, eval_sets=None,
+                  return_nets=False):
     """Out-of-fold predictions of y from z with a 2-hidden-layer MLP, and per-variable R2.
 
     eval_sets: optional {name: array shaped like z}. Each array's rows in a held-out
     fold are passed through that fold's frozen net (same input standardisation), so
     e.g. predictor latents are read by a probe that never saw their episode and was
     never fitted on predictor output. Then returns (pred, r2, {name: prediction}).
+    return_nets: also return the frozen fold nets as a FoldProbe (last element), for reading rows of
+    episodes outside z (counterfactual study). Training is unchanged by it.
     Uses the GPU only if one is visible (set CUDA_VISIBLE_DEVICES=-1 to force CPU)."""
     import torch
     import torch.nn as nn
@@ -43,6 +46,7 @@ def mlp_cross_fit(z, y, episode, hidden=256, epochs=40, batch=512, lr=1e-3, seed
     T = lambda v: torch.as_tensor(v, dtype=torch.float32, device=dev)  # noqa: E731
     pred = np.zeros_like(y, dtype=np.float64)
     extra = {n: np.zeros((len(a), y.shape[1])) for n, a in (eval_sets or {}).items()}
+    kept = []
     for k, te in enumerate(folds(episode)):
         zm, zs = z[~te].mean(0), np.maximum(z[~te].std(0), 1e-6)
         ym, ys = y[~te].mean(0), np.maximum(y[~te].std(0), 1e-12)
@@ -68,13 +72,33 @@ def mlp_cross_fit(z, y, episode, hidden=256, epochs=40, batch=512, lr=1e-3, seed
             pred[te] = net(T((z[te] - zm) / zs)).cpu().numpy() * ys + ym
             for n, a in (eval_sets or {}).items():
                 extra[n][te] = net(T((a[te] - zm) / zs)).cpu().numpy() * ys + ym
-    if eval_sets is None:
-        return pred, r2(y, pred)
-    return pred, r2(y, pred), extra
+        if return_nets:
+            kept.append((net.cpu(), zm, zs, ym, ys))
+    out = (pred, r2(y, pred)) + ((extra,) if eval_sets is not None else ())
+    return out + (FoldProbe(kept),) if return_nets else out
 
 
-def fit_differential(E, seed=0, shuffle_control=True, eps=None):
-    """E: output of extract.extract(). Returns {'dd_pred', 'dd_enc', 'action_effect', 'report'}.
+class FoldProbe:
+    """The frozen fold nets of one cross-fit. __call__ reads new rows with the average of the fold nets."""
+
+    def __init__(self, folds_):
+        self.folds = folds_
+
+    def __call__(self, z, batch=8192):
+        import torch
+        z = np.asarray(z, np.float64)
+        out = np.zeros((len(z), len(self.folds[0][3])))
+        with torch.no_grad():
+            for net, zm, zs, ym, ys in self.folds:
+                for i in range(0, len(z), batch):
+                    x = torch.as_tensor((z[i:i + batch] - zm) / zs, dtype=torch.float32)
+                    out[i:i + batch] += net(x).numpy() * ys + ym
+        return out / len(self.folds)
+
+
+def fit_differential(E, seed=0, shuffle_control=True, eps=None, return_nets=False):
+    """E: output of extract.extract(). Returns {'dd_pred', 'dd_enc', 'action_effect', 'report'}
+    (plus 'probe': a FoldProbe with return_nets=True).
 
     action_effect: finite difference of Q_D along d zhat / d u for u_t, u_{t-1}, u_{t-2}, normalised
     like the expert effect sizes: mean |d change / d u| * sd(u) / sd(change)."""
@@ -89,7 +113,8 @@ def fit_differential(E, seed=0, shuffle_control=True, eps=None):
     for a in range(g.shape[-1]):
         ev_in[f'a{a}+'] = dz_pred + eps * g[:, :, a]
         ev_in[f'a{a}-'] = dz_pred - eps * g[:, :, a]
-    dd_enc, _, ev = mlp_cross_fit(dz_enc, dd_true, ep, seed=seed * 1000 + NET_SEED, eval_sets=ev_in)
+    fit = mlp_cross_fit(dz_enc, dd_true, ep, seed=seed * 1000 + NET_SEED, eval_sets=ev_in, return_nets=return_nets)
+    dd_enc, _, ev = fit[:3]
     dd_pred = ev['pred']
 
     sd_u, sd_t = U.std(0), np.maximum(dd_pred.std(0), 1e-12)
@@ -111,7 +136,10 @@ def fit_differential(E, seed=0, shuffle_control=True, eps=None):
     rep[testable_key()] = [bool(v >= TESTABLE_R2) for v in r_enc]
     if 'physics' in E and np.ptp(E['physics'], axis=0).max() > 0:
         rep['R2_by_physics_tercile'] = r2_by_physics(E['physics'], dd_true, dd_enc, dd_pred, names=env.PHYS_KEYS)
-    return {'dd_pred': dd_pred, 'dd_enc': dd_enc, 'report': rep, 'action_effect': effect}
+    out = {'dd_pred': dd_pred, 'dd_enc': dd_enc, 'report': rep, 'action_effect': effect}
+    if return_nets:
+        out['probe'] = fit[3]
+    return out
 
 
 def testable_key():

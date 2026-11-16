@@ -1,58 +1,76 @@
-# Do JEPA world models learn causal structure?
+# Do world models learn causal structure?
 
-A JEPA world model is trained on rendered frames only (no state input). We read a cause-and-effect graph out of its *predicted* state changes and compare it with the graph derived from the exact physics equations. The study covers two environments: **cart-pole** and **Acrobot** (a double pendulum with an unrelated distractor object).
+A world model is trained on rendered frames only (no state input). We read a cause-and-effect graph out of its *predicted* state changes and compare it with the graph derived from the exact physics equations. Two environments: **cart-pole** and **Acrobot** (a double pendulum with an unrelated distractor object). Two world models: our **JEPA** and **DreamerV3**, both trained on the same data and scored against the same expert graphs.
 
 **Results, discussion and related work are in [BTP_REPORT.md](BTP_REPORT.md).** This README covers what the code does, how to run it, and where each output goes.
 
-## Status (2026-11-12)
+## Status (2026-11-13)
 
 | | Cart-pole (`datasets/cc_phys`) | Acrobot (`datasets/ac_phys`) |
 |---|---|---|
 | Equation checks and expert graph | done, 6/6 pass | done, 6/6 pass |
 | JEPA training (200 epochs) | done (`runs/jepa_cc_phys`) | done (`runs/jepa_ac_phys`) |
-| Differential probe, epochs 200 and 0 | done | done |
+| JEPA probe and graphs, epochs 200 and 0 | done | done |
 | Pruning-rule choice | done: `null_cal_fwer` | fixed in advance: `null_cal_fwer` |
-| Graphs from the true data and the model, epochs 200 and 0 | done (inside the pruning comparison) | done |
-| Graph on unseen (validation) episodes | — | done, epoch 200 |
+| JEPA graph on unseen (validation) episodes | — | done, epoch 200 |
+| JEPA 21-checkpoint training curve | done (`curve_s20/curve_summary.md`; not yet in the report) | postponed |
+| DreamerV3 port, smoke test | done | done |
+| DreamerV3 training (500 epochs), probe and graphs | **to do** | **to do** |
 | Rule check on fixed physics (`datasets/cc`) | **to do** | — |
-| 21-checkpoint training curve | **to do** | postponed |
+| Counterfactual queries (JEPA, epoch 200; `docs/counterfactual_study.md`) | done | done |
 | Interchange interventions | **to do** | **to do** |
 
 ## Method in one paragraph
 
 1. **Simulate** each environment with hidden physics drawn per episode, and render 128×128 frames.
 2. **Derive the expert graph** from the exact equations: the Jacobian of one transition, at each row's own physics, cut into strong / weak / absent tiers at a normalised effect of 0.1.
-3. **Train the JEPA** on pixels only: a ViT encoder, a transformer predictor that sees the last 5 latents and the actions [u(t−1), u(t)], an inverse model, and SIGReg.
-4. **Read the predicted change** with the *differential probe*. It is an MLP fitted on the encoder's real latent change z(t+1) − z(t), then frozen and applied to the predictor's change ẑ(t+1) − z(t). A target counts as testable only if the encoder's own change is readable (R² ≥ 0.5).
+3. **Train a world model** on pixels only: the JEPA (ViT encoder, transformer predictor over the last 5 latents and the actions [u(t−1), u(t)], inverse model, SIGReg) or DreamerV3 (recurrent state-space model with image reconstruction).
+4. **Read the predicted change** with the *differential probe*. It is an MLP fitted on the model's real latent change z(t+1) − z(t) (encoder side), then frozen and applied to the predicted change ẑ(t+1) − z(t). A target counts as testable only if the encoder-side change is readable (R² ≥ 0.5).
 5. **Score every edge**, from the true simulator inputs to the read-out change, with leave-one-covariate-out (LOCO) refits and shuffled decoys over 50 random episode half-splits.
 6. **Prune** with `null_cal_fwer`: an edge is kept only if it beats the largest edge statistic in every one of 20 shuffled-target repeats (max-T, exact permutation p ≤ 0.05).
 7. **Compare** with the expert graph: strong-graph F1, AUROC and false positives. The untrained (epoch-0) model gives the floor.
 
-Fixed before any result: frame skip, the 5-latent history, the [u(t−1), u(t)] action context, true-state edge inputs, the testable cut R² ≥ 0.5, the tier cut 0.1 and the 50 splits. For Acrobot the pruning rule (`null_cal_fwer`) and the differential probe were also fixed in advance, with no rule comparison.
+Fixed before any result: frame skip, the 5-latent history, the [u(t−1), u(t)] action context, true-state edge inputs, the testable cut R² ≥ 0.5, the tier cut 0.1 and the 50 splits. For Acrobot the pruning rule (`null_cal_fwer`) and the differential probe were also fixed in advance, with no rule comparison. DreamerV3's settings are fixed in `configs/models/dreamer_*.yaml` (see "DreamerV3" below).
 
 ## Folder layout
 
-| Path | What it is |
-|---|---|
-| `BTP_REPORT.md` | The report: approach, environments, answer key, results, related work, limitations |
-| `cc_common.py` | Cart-pole constants, Euler step, episode → (inputs, targets) stacking, dataset loading |
-| `envs/` | Environment registry (`cartpole`, `acrobot`). Shared code picks the environment from the dataset's `metadata.json` (`"env"`; no key = cart-pole) |
-| `sim/` | Simulators: `cartpole.py`, `acrobot.py` (Spong arm + spring-driven distractor block) |
-| `configs/` | `causal_cartpole.yaml`, `causal_acrobot.yaml`: environment, physics ranges, episode mix, model and training settings |
-| `checks/` | Step 1: `verify_equations.py` (cart-pole; `--env acrobot` hands over to Acrobot), `verify_acrobot.py`. Writes the expert graph |
-| `expert_graph.py` | Hand-derived cart-pole graph (adjacency, initial tiers); used by the checks |
-| `datagen/` | Step 2: `generate.py` (datasets), `dataset.py` (training windows) |
-| `model/` | JEPA (`jepa.py`) and the SIGReg loss (`sigreg.py`) |
-| `train_cc.py` | Step 3: trains the JEPA for either environment |
-| `probing/` | Step 4: `extract.py` (latents, predictor output, true variables; cached), `fit_probes.py` (differential probe) |
-| `discovery/` | Steps 5–6: `edge_scores.py` (LOCO + decoys), `prune.py` (all pruning rules), `null_calibration.py` (shuffled-target repeats) |
-| `evaluate/compare.py` | Step 7: comparison with the expert graph, markdown tables, plots |
-| `run_all.py` | Steps 4–7 end to end: data baseline, one checkpoint, probe only, or the training curve |
-| `compare_pruning.py` | Cart-pole only: compares all pruning rules on the same scores (report §6) |
-| `diagnose_physics.py` | Cart-pole only: does the hidden physics confound the true-data graph? (report §7) |
-| `compare_pruning_phys.py` | Cart-pole only: every graph scored conditional on the episode physics (sensitivity analysis) |
-| `reports/`, `research_notes/` | Literature review behind report §9 (with source tags) and its four research notes |
-| `datasets/`, `runs/`, `results/`, `logs/` | Data, checkpoints and extraction caches, outputs, logs (all git-ignored) |
+```
+causal_structure_cartpole/
+├── README.md  BTP_REPORT.md  requirements.txt
+├── run_all.py          Steps 4-7 for any model: probe -> edge scores -> pruning -> comparison
+├── paths.py            every folder and output path, in one place
+├── common.py           generic helpers: load a dataset split, stack episodes into edge inputs/targets
+├── configs/
+│   ├── envs/           cartpole.yaml, acrobot.yaml: environment, physics ranges, dataset policies
+│   └── models/         jepa_<env>.yaml, dreamer_<env>.yaml: model + training settings
+├── envs/               environment registry: variables, names, graph layout (cartpole.py, acrobot.py)
+├── sim/                simulators and renderers (cartpole.py, acrobot.py)
+├── checks/             Step 1: equation checks and the expert graph (verify_equations.py, verify_acrobot.py,
+│                       expert_graph.py = hand-derived cart-pole graph)
+├── datagen/            Step 2: generate.py (datasets), windows.py (JEPA training windows),
+│                       episodes.py (whole-episode batches for DreamerV3)
+├── models/
+│   ├── jepa/           model.py, sigreg.py, train.py
+│   └── dreamer/        model.py (DreamerV3 world model + LaProp optimizer), train.py
+├── probing/            Step 4: extract.py (picks the extractor by model type), extract_jepa.py,
+│                       extract_dreamer.py, fit_probes.py (differential probe)
+├── discovery/          Steps 5-6: edge_scores.py (LOCO + decoys), prune.py (pruning rules),
+│                       null_calibration.py (shuffled-target repeats)
+├── evaluate/           Step 7: compare.py (comparison with the expert graph, tables, plots)
+├── counterfactual/     counterfactual queries: queries.py (windows, re-solved interventions, simulation,
+│                       GPU renderer), model_jepa.py, scm.py (graph-restricted SCMs), metrics.py
+├── studies/            side studies: cartpole_pruning_rules.py (rule comparison, report §6),
+│                       cartpole_physics_confounding.py (report §7), cartpole_pruning_rules_phys.py,
+│                       counterfactual.py (counterfactual study, both envs, report §12)
+├── docs/               counterfactual_study.md, literature_review.md, research_notes/, curve_viz.html
+├── datasets/           generated data                                   (git-ignored)
+├── runs/               <model>_<data>/: checkpoints, config.yaml, history.json, extract/ caches;
+│                       _smoke/ holds smoke-test runs                     (git-ignored)
+├── results/            every output, see "Outputs"                       (git-ignored)
+└── logs/               console logs                                      (git-ignored)
+```
+
+Shared code picks the environment from the dataset's `metadata.json` (`"env"`; no key = cart-pole), and the model from the checkpoint's `model_type` (no key = JEPA).
 
 ## Setup
 
@@ -64,9 +82,10 @@ uv venv .venv --python 3.12            # or: python -m venv .venv
 $PY = ".\.venv\Scripts\python.exe"; $env:PYTHONUTF8 = "1"   # the scripts print Unicode
 ```
 
+- **Run everything from this folder** as modules (`& $PY -m package.script`); only `run_all.py` is a plain script.
 - **CPU only:** set `$env:CUDA_VISIBLE_DEVICES = "-1"`. Never set it to `""`: PowerShell then deletes the variable, and the GPU is used anyway.
-- **GPU loss:** the RTX 5090 on this machine sometimes drops off the driver ("GPU is lost"). Kill the frozen Python process, reboot, and rerun the same command. Every long step is resumable.
-- The code is self-contained. The model architecture follows the `JEPA_control` cart-pole model, but nothing is imported from it.
+- **GPU loss and crashes:** the RTX 5090 on this machine sometimes drops off the driver ("GPU is lost"), and on 2026-11-13 three runs died with native crashes ("Illegal instruction", "access violation") in plain NumPy and PyTorch code. Kill a frozen Python process, reboot if the GPU is lost, and rerun the same command. Every long step is resumable (training with `--resume <run>/checkpoints/checkpoint_last.pt`).
+- The code is self-contained. The JEPA follows the `JEPA_control` cart-pole model and DreamerV3 follows the official implementation, but nothing is imported from either.
 
 ## Run order
 
@@ -75,43 +94,42 @@ Each command runs from this folder. Times are on the RTX 5090.
 ### Cart-pole, varied physics (main study)
 
 ```powershell
-& $PY checks\verify_equations.py --vary-physics                     # ~5 min CPU -> expert graph + checks
-& $PY datagen\generate.py --vary-physics                            # -> datasets/cc_phys
+& $PY -m checks.verify_equations --vary-physics                     # ~5 min CPU -> expert graph + checks
+& $PY -m datagen.generate --vary-physics                            # -> datasets/cc_phys
 & $PY -m discovery.null_calibration --data datasets/cc_phys --reps 20   # ~4-5 min per repeat
-& $PY train_cc.py --data datasets/cc_phys --save-dir runs/jepa_cc_phys  # ~3.5 h; --resume <ckpt> to continue
+& $PY -m models.jepa.train --data datasets/cc_phys --config configs/models/jepa_cartpole.yaml --save-dir runs/jepa_cc_phys  # ~3.5 h
 & $PY run_all.py --data datasets/cc_phys --ckpt runs/jepa_cc_phys/checkpoints/checkpoint_epoch0200.pt --probe-only --seeds 3
 & $PY run_all.py --data datasets/cc_phys --ckpt runs/jepa_cc_phys/checkpoints/checkpoint_epoch0000.pt --probe-only --seeds 3
-& $PY compare_pruning.py --data datasets/cc_phys --run-dir runs/jepa_cc_phys   # all rules; data, noise, null and model graphs
-& $PY diagnose_physics.py --data datasets/cc_phys --run-dir runs/jepa_cc_phys
-& $PY compare_pruning_phys.py --data datasets/cc_phys --run-dir runs/jepa_cc_phys
+& $PY -m studies.cartpole_pruning_rules --data datasets/cc_phys --run-dir runs/jepa_cc_phys   # all rules; data, noise, null and model graphs
+& $PY -m studies.cartpole_physics_confounding --data datasets/cc_phys --run-dir runs/jepa_cc_phys
+& $PY -m studies.cartpole_pruning_rules_phys --data datasets/cc_phys --run-dir runs/jepa_cc_phys
+# 21-checkpoint curve: the null must use the same split count as the curve
+& $PY -m discovery.null_calibration --data datasets/cc_phys --reps 20 --splits 20
+& $PY run_all.py --data datasets/cc_phys --run-dir runs/jepa_cc_phys --curve --splits 20 --prune null_cal_fwer
 ```
 
-The cart-pole graphs in the report (true data, trained model, untrained model) are the `null_cal_fwer` rows of `compare_pruning.py`. The same graphs can be produced as stand-alone runs:
+The cart-pole graphs in the report (true data, trained model, untrained model) are the `null_cal_fwer` rows of `studies.cartpole_pruning_rules`. The same graphs can be produced as stand-alone runs:
 
 ```powershell
 & $PY run_all.py --data datasets/cc_phys --data-baseline --prune null_cal_fwer
 & $PY run_all.py --data datasets/cc_phys --ckpt runs/jepa_cc_phys/checkpoints/checkpoint_epoch0200.pt --prune null_cal_fwer
 ```
 
-Still to do:
+Still to do: the rule check on fixed physics, which needs its own null first.
 
 ```powershell
-# rule check on fixed physics: needs its own null first
 & $PY -m discovery.null_calibration --data datasets/cc --reps 20
-& $PY compare_pruning.py --data datasets/cc --run-dir runs/jepa_cc
-# 21-checkpoint curve: the null must use the same split count as the curve
-& $PY -m discovery.null_calibration --data datasets/cc_phys --reps 20 --splits 20
-& $PY run_all.py --data datasets/cc_phys --run-dir runs/jepa_cc_phys --curve --splits 20 --prune null_cal_fwer
+& $PY -m studies.cartpole_pruning_rules --data datasets/cc --run-dir runs/jepa_cc
 ```
 
 ### Acrobot
 
 ```powershell
-& $PY checks\verify_equations.py --env acrobot --vary-physics       # -> expert graph + checks
-& $PY datagen\generate.py --env acrobot --vary-physics              # ~35 min -> datasets/ac_phys
+& $PY -m checks.verify_equations --env acrobot --vary-physics       # -> expert graph + checks
+& $PY -m datagen.generate --env acrobot --vary-physics              # ~35 min -> datasets/ac_phys
 & $PY -m discovery.null_calibration --data datasets/ac_phys --reps 20
 & $PY run_all.py --data datasets/ac_phys --data-baseline --prune null_cal_fwer
-& $PY train_cc.py --data datasets/ac_phys --config configs/causal_acrobot.yaml --save-dir runs/jepa_ac_phys   # ~3.5 h
+& $PY -m models.jepa.train --data datasets/ac_phys --config configs/models/jepa_acrobot.yaml --save-dir runs/jepa_ac_phys   # ~3.5 h
 & $PY run_all.py --data datasets/ac_phys --ckpt runs/jepa_ac_phys/checkpoints/checkpoint_epoch0200.pt --probe-only --seeds 3
 & $PY run_all.py --data datasets/ac_phys --ckpt runs/jepa_ac_phys/checkpoints/checkpoint_epoch0000.pt --probe-only --seeds 3
 & $PY run_all.py --data datasets/ac_phys --ckpt runs/jepa_ac_phys/checkpoints/checkpoint_epoch0200.pt --prune null_cal_fwer
@@ -122,42 +140,89 @@ Still to do:
 & $PY run_all.py --data datasets/ac_phys --ckpt runs/jepa_ac_phys/checkpoints/checkpoint_epoch0200.pt --prune null_cal_fwer --split val
 ```
 
+### DreamerV3
+
+DreamerV3 is trained offline on the same datasets as the JEPA, so the expert graphs, nulls and data baselines above are reused unchanged. The extractor produces exactly the JEPA's rows (checked).
+
+```powershell
+# cart-pole (~25 s per epoch -> ~3.5 h)
+& $PY -m models.dreamer.train --data datasets/cc_phys --config configs/models/dreamer_cartpole.yaml --save-dir runs/dreamer_cc_phys
+& $PY run_all.py --data datasets/cc_phys --ckpt runs/dreamer_cc_phys/checkpoints/checkpoint_epoch0500.pt --probe-only --seeds 3
+& $PY run_all.py --data datasets/cc_phys --ckpt runs/dreamer_cc_phys/checkpoints/checkpoint_epoch0000.pt --probe-only --seeds 3
+& $PY run_all.py --data datasets/cc_phys --ckpt runs/dreamer_cc_phys/checkpoints/checkpoint_epoch0500.pt --prune null_cal_fwer
+& $PY run_all.py --data datasets/cc_phys --ckpt runs/dreamer_cc_phys/checkpoints/checkpoint_epoch0000.pt --prune null_cal_fwer
+# Acrobot (~6 h): the same with datasets/ac_phys, configs/models/dreamer_acrobot.yaml, runs/dreamer_ac_phys
+# curve (cart-pole): 21 checkpoints, nulls with --splits 20 already exist
+& $PY run_all.py --data datasets/cc_phys --run-dir runs/dreamer_cc_phys --curve --splits 20 --prune null_cal_fwer
+```
+
+Fixed before any result (2026-11-13):
+
+- **Model.** The official world model at preset `size12m` (deter 2048, hidden 256, 32 latents × 16 classes, 8 blocks, 1% unimix, CNN depth 16), 7.7M parameters, 128×128 frames (one extra encoder/decoder stage), no reward, continue or policy heads. Losses: reconstruction 1.0, dyn 1.0, rep 0.1, free nats 1. Optimizer: LaProp, lr 4e-5, eps 1e-20, AGC 0.3, 1000 warmup steps. Deviations from the official code are listed in `models/dreamer/model.py` (`DEVIATIONS`).
+- **Training.** 500 epochs (one epoch = every training episode once, as whole episodes from t = 0; batch 16, ~95 steps), checkpoints every 25 epochs (21 in all, epoch 0 = untrained floor). The trained result is the last checkpoint, epoch 500. Seed 42.
+- **Readout.** Episodes are filtered from t = 0 with the posterior *mode* fed back, and features are [h, z-probabilities] (2560 dims). z(t) = posterior at t; z(t+1) = posterior at t+1 (sees frame t+1, the encoder control); ẑ(t+1) = prior at t+1 (no frame t+1, the prediction). Prior and posterior share h(t+1), so their difference is in z only. The same probe on the z part alone is stored as `probe.diag_z_only` (a diagnostic; no edges are scored on it).
+- Everything else is as for the JEPA: differential probe, testable cut 0.5, 50 splits (20 for the curve), `null_cal_fwer`, tier cut 0.1, true-state edge inputs, train split.
+- `runs/<run>/reports/epoch####.png` shows real frames, posterior reconstructions and a 10-step open-loop prior rollout every 25 epochs.
+
+### Counterfactual queries (JEPA)
+
+Recovered graph vs expert graph vs the model itself, on interventions with a physically consistent history (method and results: `docs/counterfactual_study.md`). It needs the 50-split `null_cal_fwer` graph of the checkpoint (the `run_all.py --prune null_cal_fwer` lines above). It takes a few minutes per run on the GPU and is resumable (caches in `runs/<run>/counterfactual/`).
+
+```powershell
+foreach ($d in @(@("cc_phys", "jepa_cc_phys"), @("ac_phys", "jepa_ac_phys"))) {
+  $C = "runs/$($d[1])/checkpoints/checkpoint_epoch0200.pt"
+  & $PY -m studies.counterfactual --data datasets/$($d[0]) --ckpt $C               # main, kappa 0.25
+  & $PY -m studies.counterfactual --data datasets/$($d[0]) --ckpt $C --kappa 0.5   # sensitivity
+  & $PY -m studies.counterfactual --data datasets/$($d[0]) --ckpt $C --rollout     # multi-step (k = 1..3)
+}
+```
+
+Smoke test: `--data datasets/cc_small --ckpt runs/_smoke/jepa_cc_small/checkpoints/checkpoint_epoch0001.pt --graph expert --windows 60` (`--graph expert` stands in for a recovered graph the smoke run does not have).
+
 ### Cart-pole, fixed physics (first model)
 
-`datasets/cc` and `runs/jepa_cc` are the original fixed-physics data and model: `datagen\generate.py` without `--vary-physics`, and `checks\verify_equations.py` without the flag. Report §7 uses this model's probe ("trained on fixed physics"). Every command above also works with `--data datasets/cc`. Without `--vary-physics` the generator reproduces `datasets/cc` exactly.
+`datasets/cc` and `runs/jepa_cc` are the original fixed-physics data and model: `-m datagen.generate` without `--vary-physics`, and `-m checks.verify_equations` without the flag. Report §7 uses this model's probe ("trained on fixed physics"). Every command above also works with `--data datasets/cc`. Without `--vary-physics` the generator reproduces `datasets/cc` exactly.
 
 ### Smoke test
 
-`datagen\generate.py --small` writes a tiny cart-pole dataset (`datasets/cc_small`); `datagen\generate.py --env acrobot --vary-physics --small` writes `datasets/ac_phys_small`. Train it for one epoch with `train_cc.py ... --epochs 1`, then run `run_all.py` on it. This exercises the whole pipeline in minutes.
+`-m datagen.generate --small` writes a tiny cart-pole dataset (`datasets/cc_small`); `-m datagen.generate --env acrobot --vary-physics --small` writes `datasets/ac_phys_small`. Train either model for one epoch into `runs/_smoke/` (its results then go to `results/_smoke/`), then run `run_all.py` on it. This exercises the whole pipeline in minutes:
+
+```powershell
+& $PY -m models.dreamer.train --data datasets/cc_small --config configs/models/dreamer_cartpole.yaml --save-dir runs/_smoke/dreamer_cc_small --epochs 1
+& $PY run_all.py --data datasets/cc_small --ckpt runs/_smoke/dreamer_cc_small/checkpoints/checkpoint_epoch0001.pt --splits 2 --prune margin
+```
 
 ## Important flags and gotchas
 
 - **Always pass `--prune null_cal_fwer`.** `run_all.py` still defaults to `margin`, the original rule, and the rule name is part of every output path.
-- **The null must match the rows and the split count.** `null_cal*` rules read `results/null_calibration_<data>[_<split>]/rep###_s<splits>.json`. A run with `--splits 20` or `--split val` needs nulls made with the same option.
-- **Batch-norm recalibration (Acrobot).** The Acrobot encoder's batch-norm running statistics go stale, which made eval-mode losses meaningless (val 15 instead of 0.45). For Acrobot (`RECALIBRATE_BN` in `envs/acrobot.py`), training and extraction recompute them from 200 training batches before every evaluation. Cart-pole is unaffected. Extraction cache names do not record this. Delete any Acrobot cache made before the fix (2026-11-11 15:09); the one known stale cache is already renamed `*.stale_pre_bnfix`.
-- **Caches.** Extractions are cached in `runs/<run>/extract/<data>[_<split>]_<checkpoint>.npz` (~100 MB each), null repeats and comparison scores in `results/`. Finished checkpoints are skipped on a rerun.
-- **Training-time probe.** `train_cc.py` logs a ridge probe (`probe_r2_x_xdot_theta_thetadot`) as a rough progress signal. For Acrobot it reads the raw 6-d state with unwrapped angles, so it is not a result.
+- **The null must match the rows and the split count.** `null_cal*` rules read `results/nulls/null_calibration_<data>[_<split>]/rep###_s<splits>.json`. A run with `--splits 20` or `--split val` needs nulls made with the same option. Nulls depend only on the dataset, so every model shares them.
+- **Batch-norm recalibration (JEPA on Acrobot).** The Acrobot JEPA encoder's batch-norm running statistics go stale, which made eval-mode losses meaningless (val 15 instead of 0.45). For Acrobot (`RECALIBRATE_BN` in `envs/acrobot.py`), JEPA training and extraction recompute them from 200 training batches before every evaluation. Cart-pole is unaffected, and DreamerV3 has no batch norm. Extraction cache names do not record this. Delete any Acrobot cache made before the fix (2026-11-11 15:09); the one known stale cache is already renamed `*.stale_pre_bnfix`.
+- **Caches.** Extractions are cached in `runs/<run>/extract/<data>[_<split>]_<checkpoint>.npz`: ~100 MB for the JEPA, ~1.5 GB (cart-pole) and ~3 GB (Acrobot) for DreamerV3, whose features are 2560-d. A DreamerV3 curve therefore needs ~30 GB of disk on cart-pole. Null repeats and comparison scores are cached in `results/`. Finished checkpoints are skipped on a rerun.
+- **Training-time probe (JEPA).** `models.jepa.train` logs a ridge probe (`probe_r2_x_xdot_theta_thetadot`) as a rough progress signal. For Acrobot it reads the raw 6-d state with unwrapped angles, so it is not a result.
 - **Acrobot angles** enter edge scoring as a (sin θ, cos θ) pair. LOCO drops the pair, and the decoys shuffle it, as one node.
 
 ## Outputs
 
-`<tag>` is `_<dataset name>` (empty for `datasets/cc`) plus `_<split>` when the split is not `train`.
+`<tag>` is `_<dataset name>` (empty for `datasets/cc`) plus `_<split>` when the split is not `train`. `<model>` is `jepa` or `dreamer`.
 
 | File | Contents | Report |
 |---|---|---|
-| `results/checks<_cc_phys or _ac_phys>.json` | The six equation checks | §3 |
-| `results/expert_graph_final<_cc_phys or _ac_phys>.json` | Expert graph with tiers and effects (no suffix = `datasets/cc`) | §3 |
+| `results/expert_graphs/checks<_cc_phys or _ac_phys>.json` | The six equation checks | §3 |
+| `results/expert_graphs/expert_graph_final<_cc_phys or _ac_phys>.json` | Expert graph with tiers and effects (no suffix = `datasets/cc`) | §3 |
 | `datasets/<data>/summary.json` | Episode and transition counts, physics ranges | §2 |
-| `runs/<run>/history.json`, `config.yaml`, `checkpoints/` | Training losses per epoch, 21 checkpoints (every 10 epochs) | §4 |
-| `results/<run><tag>_diff_<rule>/epoch####/probe.json` | Differential-probe R² (encoder and predictor, seed spread) | §7, §8 |
-| `results/<run><tag>_diff_<rule>/epoch####/{summary.md, edges.md, results.json}` | Graph from one checkpoint: metrics, per-edge table, full scores | §8 |
-| `results/data_baseline<tag>_<rule>.json` | Graph from the true targets | §8 |
-| `results/null_calibration_<data>[_<split>]/` | Shuffled-target null repeats | §6 |
-| `results/pruning_comparison_cc_phys_jepa_cc_phys/report.md` | All pruning rules on all validation and model graphs | §6, §7 |
-| `results/physics_conditioning_cc_phys/report.md` | Hidden-physics confounding of the data graph | §7 |
-| `results/pruning_comparison_phys_cc_phys_jepa_cc_phys/report.md` | Physics-conditioned rule comparison | §6 |
+| `runs/<run>/history.json`, `config.yaml`, `checkpoints/` | Training losses per epoch, 21 checkpoints | §4 |
+| `results/<model>/<run><tag>_diff_<rule>/epoch####/probe.json` | Differential-probe R² (encoder and predictor, seed spread) | §7, §8 |
+| `results/<model>/<run><tag>_diff_<rule>/epoch####/{summary.md, edges.md, results.json}` | Graph from one checkpoint: metrics, per-edge table, full scores | §8 |
+| `results/<model>/<run><tag>_diff_<rule>/curve.json`, `curve_s<splits>/` | Training curve | — |
+| `results/data_baselines/data_baseline<tag>_<rule>.json` | Graph from the true targets | §8 |
+| `results/nulls/null_calibration_<data>[_<split>]/` | Shuffled-target null repeats | §6 |
+| `results/studies/pruning_comparison_cc_phys_jepa_cc_phys/report.md` | All pruning rules on all validation and model graphs | §6, §7 |
+| `results/studies/physics_conditioning_cc_phys/report.md` | Hidden-physics confounding of the data graph | §7 |
+| `results/studies/pruning_comparison_phys_cc_phys_jepa_cc_phys/report.md` | Physics-conditioned rule comparison | §6 |
+| `results/studies/counterfactual_<data>_<run>/epoch####_k###[_rollout]/` | Counterfactual study: `report.md` (all sections), `discovery_vs_model.md`, `confounding.md`, `physics.md`, `rollout.md`, `ce_heatmaps.png`, `results.json` | §12 |
+| `results/_smoke/` | Results of runs in `runs/_smoke/` | — |
 
-The report's cart-pole probe table reads `results/jepa_cc_arms/epoch0200/differential/probe.json` (fixed physics; this folder was named under the earlier three-readout design), `results/jepa_cc_cc_phys_diff_margin/epoch0200/probe.json` (fixed-physics model on varied physics) and `results/jepa_cc_phys_cc_phys_diff_margin/epoch0200/probe.json`. The probe does not depend on the pruning rule, so `_margin` in these names does not matter.
+The report's cart-pole probe table reads `results/jepa/jepa_cc_arms/epoch0200/differential/probe.json` (fixed physics; this folder was named under the earlier three-readout design), `results/jepa/jepa_cc_cc_phys_diff_margin/epoch0200/probe.json` (fixed-physics model on varied physics) and `results/jepa/jepa_cc_phys_cc_phys_diff_margin/epoch0200/probe.json`. The probe does not depend on the pruning rule, so `_margin` in these names does not matter.
 
 ## Pruning rules (`discovery/prune.py`)
 

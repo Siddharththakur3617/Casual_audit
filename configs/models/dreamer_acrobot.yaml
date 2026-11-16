@@ -1,0 +1,41 @@
+# DreamerV3 world model on acrobot: model + training settings (fixed before any result, 2026-11-13).
+# Used by: python -m models.dreamer.train --data datasets/ac_phys --config configs/models/dreamer_acrobot.yaml
+# Values: official DreamerV3 configs.yaml (github.com/danijar/dreamerv3), preset size12m; world model
+# only (no reward / continue heads, no actor-critic). Deviations: models/dreamer/model.py DEVIATIONS.
+
+model:
+  image_size: 128          # same frames as the JEPA
+  action_dim: 1
+  # RSSM (size12m: deter 2048, hidden 256, classes 16; stoch 32, blocks 8, unimix 0.01 from the defaults)
+  deter: 2048
+  hidden: 256
+  stoch: 32
+  classes: 16
+  blocks: 8
+  unimix: 0.01
+  imglayers: 2
+  obslayers: 1
+  # image encoder / decoder (size12m: depth 16; mults (2,3,4,4) + one stage for 128 px; kernel 5)
+  depth: 16
+  mults: [2, 3, 4, 4, 4]
+  kernel: 5
+  minres: 4
+  units: 256
+  bspace: 8
+
+training:
+  batch_size: 16           # whole episodes (padded to the longest, masked)
+  epochs: 500              # 1 epoch = every training episode once (~95 steps); ~47.5k steps in all
+  checkpoint_every: 25     # -> 21 checkpoints, epoch 0 = untrained
+  report_every: 25         # reconstruction + open-loop rollout PNG
+  open_loop_context: 5
+  free_nats: 1.0
+  loss_scales: {rec: 1.0, dyn: 1.0, rep: 0.1}
+  # optimizer (official): LaProp, lr 4e-5, eps 1e-20, AGC 0.3, warmup 1000 steps, no weight decay
+  lr: 4.0e-05
+  beta1: 0.9
+  beta2: 0.999
+  eps: 1.0e-20
+  agc: 0.3
+  warmup: 1000
+  num_workers: 0

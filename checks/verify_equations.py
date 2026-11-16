@@ -7,9 +7,8 @@
 (e) effect sizes -> final strong/weak tiers
 (f) Markov check: older forces / older states add nothing
 
-Run: python checks/verify_equations.py                 -> results/checks.json, results/expert_graph_final.json
-     python checks/verify_equations.py --vary-physics  -> results/checks_cc_phys.json,
-                                                          results/expert_graph_final_cc_phys.json
+Run: python -m checks.verify_equations                 -> results/expert_graphs/{checks, expert_graph_final}.json
+     python -m checks.verify_equations --vary-physics  -> results/expert_graphs/{checks, expert_graph_final}_cc_phys.json
 
 --vary-physics: the dataset policies with per-episode M, m, l, g (datasets/cc_phys). The graph is still the
 28 state/action edges; physics is not a node. Every transition is differentiated at its own episode's physics,
@@ -21,15 +20,15 @@ from __future__ import annotations
 import argparse
 import json
 import sys
-from pathlib import Path
 
 import numpy as np
 import sympy as sp
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from cc_common import (DT, FRAME_SKIP, H, INPUT_NAMES, PHYS, PHYS_KEYS, RESULTS, T_MIN,  # noqa: E402
-                       TARGET_NAMES, accelerations, macro_step, stack_episodes)
-import expert_graph  # noqa: E402
+from checks import expert_graph
+from common import stack_episodes
+from envs.cartpole import (DT, FRAME_SKIP, H, INPUT_NAMES, PHYS, PHYS_KEYS, T_MIN, TARGET_NAMES,
+                           accelerations, macro_step)
+import paths
 
 RNG = np.random.default_rng(0)
 PRNG = np.random.default_rng(1)      # physics draws (--vary-physics only)
@@ -247,7 +246,7 @@ def check_d_e(V, eps_raw):
                if tiers_derived[i, j] != tiers_final[i, j]]
     info = {}
     if VARY:      # tier changes against the fixed-physics graph, if it exists
-        ref = RESULTS / 'expert_graph_final.json'
+        ref = paths.EXPERT / 'expert_graph_final.json'
         if ref.exists():
             t_cc = np.array(json.loads(ref.read_text())['tiers'], dtype=object)
             info['tier_changes_vs_fixed_physics'] = [
@@ -268,7 +267,7 @@ def check_d_e(V, eps_raw):
         final['physics'] = {'varied': True, 'ranges': physics_ranges(),
                             'note': 'each transition differentiated at its own episode physics; '
                                     'physics is not a graph node'}
-    (RESULTS / f'expert_graph_final{SUFFIX}.json').write_text(json.dumps(final, indent=2))
+    (paths.EXPERT / f'expert_graph_final{SUFFIX}.json').write_text(json.dumps(final, indent=2))
 
 
 # ---------------------------------------------------------------- (f)
@@ -319,18 +318,17 @@ def main():
     global VARY, SUFFIX
     p = argparse.ArgumentParser()
     p.add_argument('--vary-physics', action='store_true',
-                   help='per-episode physics as in datasets/cc_phys -> results/*_cc_phys.json')
+                   help='per-episode physics as in datasets/cc_phys -> results/expert_graphs/*_cc_phys.json')
     p.add_argument('--env', default='cartpole', choices=('cartpole', 'acrobot'),
-                   help='acrobot: run checks/verify_acrobot.py instead')
+                   help='acrobot: run checks.verify_acrobot instead')
     a = p.parse_args()
     if a.env == 'acrobot':
-        sys.path.insert(0, str(Path(__file__).resolve().parent))
-        import verify_acrobot
+        from checks import verify_acrobot
         verify_acrobot.main(['--vary-physics'] if a.vary_physics else [])
         return
     VARY = a.vary_physics
     SUFFIX = '_cc_phys' if VARY else ''
-    RESULTS.mkdir(exist_ok=True)
+    paths.EXPERT.mkdir(parents=True, exist_ok=True)
     expert_graph.main()
     check_a()
     check_b()
@@ -341,9 +339,9 @@ def main():
     check_c(V)
     check_d_e(V, eps_raw)
     check_f(V)
-    (RESULTS / f'checks{SUFFIX}.json').write_text(json.dumps(REPORT, indent=2, default=str))
+    (paths.EXPERT / f'checks{SUFFIX}.json').write_text(json.dumps(REPORT, indent=2, default=str))
     n_fail = sum(not r['passed'] for r in REPORT.values())
-    print(f'\n{len(REPORT) - n_fail}/{len(REPORT)} checks passed -> results/checks{SUFFIX}.json')
+    print(f'\n{len(REPORT) - n_fail}/{len(REPORT)} checks passed -> results/expert_graphs/checks{SUFFIX}.json')
     sys.exit(1 if n_fail else 0)
 
 

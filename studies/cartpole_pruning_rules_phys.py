@@ -1,6 +1,6 @@
-"""compare_pruning.py with every graph scored conditional on the episode physics (M, m, l, g).
+"""studies/cartpole_pruning_rules.py with every graph scored conditional on the episode physics (M, m, l, g).
 
-diagnose_physics.py showed that on a varied-physics dataset the hidden physics confounds the
+studies/cartpole_physics_confounding.py showed that on a varied-physics dataset the hidden physics confounds the
 true-data graph: vbar->dvbar, vbar->dwbar, x->dvbar/dwbar look real and wbar->dwbar is inflated
 (1.17 vs expert 0.09) unless the fits are told the physics. The same edges are the two false
 positives of null_cal_vif_fwer on the epoch-200 predictor. Here every graph (data, data_noisy, null,
@@ -18,10 +18,10 @@ Declared before running:
     disappear with true physics but not with permuted physics, they were physics confounding.
   Otherwise null_cal_fwer (unconditioned) stays the main rule.
 
-Needs compare_pruning.py to have run (it caches the probe targets of both checkpoints).
-  python compare_pruning_phys.py --data datasets/cc_phys --run-dir runs/jepa_cc_phys
-Output: results/pruning_comparison_phys_<data>_<run>/{report.md, comparison.json, scores/},
-        null repeats in results/null_calibration_<data>_phys/
+Needs studies/cartpole_pruning_rules.py to have run (it caches the probe targets of both checkpoints).
+  python -m studies.cartpole_pruning_rules_phys --data datasets/cc_phys --run-dir runs/jepa_cc_phys
+Output: results/studies/pruning_comparison_phys_<data>_<run>/{report.md, comparison.json, scores/},
+        null repeats in results/nulls/null_calibration_<data>_phys/
 """
 from __future__ import annotations
 
@@ -32,20 +32,22 @@ from pathlib import Path
 
 import numpy as np
 
-from cc_common import INPUT_NAMES, PHYS_KEYS, RESULTS, TARGET_NAMES, load_split_episodes, stack_episodes
-from compare_pruning import NOISE_R2_CLIP, load_scores
+from common import load_split_episodes, stack_episodes
+from envs.cartpole import INPUT_NAMES, PHYS_KEYS, TARGET_NAMES
+from paths import NULLS, STUDIES
+from studies.cartpole_pruning_rules import NOISE_R2_CLIP, load_scores
 from discovery import edge_scores, null_calibration, prune as pr
 from evaluate import compare
 from run_all import jsonable
 
 RULES = ('min_effect', 'null_cal_fwer', 'null_cal_vif_fwer', 'null_cal_vif_fwer_inputs_only')
-PERM_SEED = 4321                        # same physics permutation as diagnose_physics.py
+PERM_SEED = 4321                        # same physics permutation as studies/cartpole_physics_confounding.py
 
 
 def scored(out, name, X, Y, ep, n_splits, cond, reuse=None):
     path = out / 'scores' / f'{name}.json'
     if not path.exists() and reuse is not None and Path(reuse).exists():
-        return load_scores(reuse)       # identical computation already cached by diagnose_physics.py
+        return load_scores(reuse)       # identical computation already cached by studies/cartpole_physics_confounding.py
     if not path.exists():
         t0 = time.time()
         s = edge_scores.score_graph(X, Y, ep, n_splits=n_splits, cond=cond)
@@ -64,12 +66,12 @@ def main():
     p.add_argument('--out', default=None)
     a = p.parse_args()
     name, run = Path(a.data).name, Path(a.run_dir).name
-    out = Path(a.out) if a.out else RESULTS / f'pruning_comparison_phys_{name}_{run}'
+    out = Path(a.out) if a.out else STUDIES / f'pruning_comparison_phys_{name}_{run}'
     out.mkdir(parents=True, exist_ok=True)
-    base = RESULTS / f'pruning_comparison_{name}_{run}'
+    base = STUDIES / f'pruning_comparison_{name}_{run}'
     A, tiers, effect = compare.load_expert(a.data)
 
-    # rows and physics: the train split, exactly the rows of compare_pruning.py and the null
+    # rows and physics: the train split, exactly the rows of studies/cartpole_pruning_rules.py and the null
     eps = load_split_episodes(a.data, 'train', with_physics=True)
     V = stack_episodes([(s, u) for s, u, _ in eps])
     X, Y, ep = V['inputs'], V['targets'], V['episode']
@@ -78,14 +80,14 @@ def main():
     C, C_shuf = P[ep], P[np.random.default_rng(PERM_SEED).permutation(len(P))][ep]
 
     probes = sorted((base / 'probe').glob('epoch*.npz'))
-    assert probes, f'run compare_pruning.py first (no cached probe targets in {base / "probe"})'
+    assert probes, f'run studies/cartpole_pruning_rules.py first (no cached probe targets in {base / "probe"})'
     M = {int(f.stem[5:]): dict(np.load(f)) for f in probes}
     last, first = max(M), min(M)
     for e, m in M.items():
         assert m['X'].shape == X.shape and np.allclose(m['X'], X) and (m['episode'] == ep).all(), \
             f'epoch {e} probe rows differ from the train split'
 
-    # data_noisy and null exactly as in compare_pruning.py (same random stream)
+    # data_noisy and null exactly as in studies/cartpole_pruning_rules.py (same random stream)
     noise_r2 = np.clip(M[last]['R2_predictor'], *NOISE_R2_CLIP)
     rng = np.random.default_rng(12345)
     sd = Y.std(0) * np.sqrt((1 - noise_r2) / noise_r2)
@@ -97,14 +99,14 @@ def main():
         graphs[f'encoder_e{e}'] = (M[e]['encoder'], C)
     graphs[f'predictor_e{last}_physshuf'] = (M[last]['predictor'], C_shuf)     # control
 
-    reuse = {'data': RESULTS / f'physics_conditioning_{name}' / 'scores' / 'data_phys_shuffled.json'}
+    reuse = {'data': STUDIES / f'physics_conditioning_{name}' / 'scores' / 'data_phys_shuffled.json'}
     S = {}
     for g, (Yg, cond) in graphs.items():
         print(f'[{g}]', flush=True)
         S[g] = scored(out, g, X, Yg, ep, a.splits, cond, reuse.get(g) if a.splits == 50 else None)
 
     # null calibrated with the same physics conditioning
-    null_dir = RESULTS / f'null_calibration_{name}_phys' if not a.out else out / 'null_calibration'
+    null_dir = NULLS / f'null_calibration_{name}_phys' if not a.out else out / 'null_calibration'
     print(f'[null calibration, physics-conditioned] {a.null_reps} shuffled-target repeats -> {null_dir}', flush=True)
     null_calibration.calibrate(a.data, a.null_reps, a.splits, out_dir=null_dir, cond=C)
     null_stats, null_r2 = null_calibration.load(a.data, a.splits, a.null_reps, out_dir=null_dir)
@@ -145,7 +147,7 @@ def main():
         L.append(f'| {r} | ' + ' | '.join(cell(kept[g][r], res[g][r]) for g in G) + ' |')
     if old:
         Go = [g for g in G if g in old['kept']]
-        L += ['', '## without physics conditioning (from compare_pruning.py)', '',
+        L += ['', '## without physics conditioning (from studies/cartpole_pruning_rules.py)', '',
               '| rule | ' + ' | '.join(Go) + ' |', '|---|' + '---|' * len(Go)]
         for r in ('min_effect', 'null_cal_fwer', 'null_cal_vif_fwer'):
             R = old['results']

@@ -7,14 +7,14 @@ statistic per edge and repeat; the rule compares the real statistic with them.
 The rows (inputs, episodes) are the dataset's train split, which is exactly what the data graphs and
 the model graphs are scored on (probing/extract.py extracts the same rows). Only the targets are
 shuffled, so a null depends on the dataset, not on any model. Repeats use different shuffles and
-different split seeds from the real graphs (real graphs: seed 0; the compare_pruning 'null' graph:
+different split seeds from the real graphs (real graphs: seed 0; the studies/cartpole_pruning_rules 'null' graph:
 shuffle seed 12345), so that graph is an untouched check of the calibration.
 
 Each repeat is cached, so the run resumes after a crash; the file name carries n_splits, because a
 null is only valid for real scores computed with the same number of splits.
 
   python -m discovery.null_calibration --data datasets/cc_phys --reps 20        # ~4-5 min per repeat on the GPU
-Output: results/null_calibration_<data>/rep###_s<splits>.json
+Output: results/nulls/null_calibration_<data>[_<split>]/rep###_s<splits>.json
 """
 from __future__ import annotations
 
@@ -25,9 +25,10 @@ from pathlib import Path
 
 import numpy as np
 
-from cc_common import RESULTS, load_split_episodes, stack_episodes
+from common import load_split_episodes, stack_episodes
 from discovery import edge_scores
 from discovery.prune import DELTA, null_statistic
+from paths import NULLS
 
 SEED_PERM = 9000        # shuffle of repeat k: default_rng(SEED_PERM + k)
 SEED_SCORE = 7000       # split / decoy / network seed of repeat k
@@ -37,7 +38,7 @@ REPS = 20               # smallest K that can reach p <= 0.05 with margin: 1 / (
 def cache_dir(data_dir, split='train'):
     """A null is only valid for the row count it was made on, so other splits get their own folder."""
     tag = '' if split == 'train' else f'_{split}'
-    return RESULTS / f'null_calibration_{Path(data_dir).name}{tag}'
+    return NULLS / f'null_calibration_{Path(data_dir).name}{tag}'
 
 
 def _path(out_dir, k, n_splits):

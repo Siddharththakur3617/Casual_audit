@@ -1,18 +1,19 @@
-"""End-to-end driver (Steps 4-7), differential probe only.
+"""End-to-end driver (Steps 4-7) for any model (JEPA, DreamerV3), differential probe only.
 
-  python run_all.py --data datasets/cc --data-baseline           # discovery on true labels only
-  python run_all.py --data datasets/cc --ckpt runs/jepa_cc/checkpoints/checkpoint_epoch0200.pt
-  python run_all.py --data datasets/cc --run-dir runs/jepa_cc --curve --splits 20
-  python run_all.py --data datasets/cc --ckpt <ckpt> --probe-only --seeds 3   # probe diagnostics only
-  python run_all.py ... --prune effect                           # choose the pruning rule (discovery/prune.py)
+  python run_all.py --data datasets/cc_phys --data-baseline --prune null_cal_fwer      # true labels only
+  python run_all.py --data datasets/cc_phys --ckpt runs/jepa_cc_phys/checkpoints/checkpoint_epoch0200.pt --prune null_cal_fwer
+  python run_all.py --data datasets/cc_phys --run-dir runs/jepa_cc_phys --curve --splits 20 --prune null_cal_fwer
+  python run_all.py --data datasets/cc_phys --ckpt <ckpt> --probe-only --seeds 3       # probe diagnostics only
 
 The model's predicted change is read with the differential probe Q_D (probing/fit_probes.py).
 Edge-scoring inputs are the true simulator states plus u_t, u_{t-1}, u_{t-2}.
-Outputs: results/<run><tag>_diff_<rule>/epoch####/{results.json, edges.md, graphs.png, summary.md},
+The extractor is chosen from the checkpoint's model type (probing/extract.py).
+Outputs: results/<model>/<run><tag>_diff_<rule>/epoch####/{results.json, edges.md, graphs.png, summary.md},
 where <tag> is _<dataset name> (empty for datasets/cc) plus _<split> when --split is not train;
-the curve goes to results/<run><tag>_diff_<rule>/curve_s<splits>/ plus curve.json and curve.png.
+<model> is jepa or dreamer (results/_smoke/ for runs in runs/_smoke/); the curve goes to
+results/<model>/<run><tag>_diff_<rule>/curve_s<splits>/ plus curve.json and curve.png.
 Runs are resumable: finished checkpoints and cached extractions (runs/<run>/extract/) are reused.
-Data baseline: results/data_baseline<tag>_<rule>.json.
+Data baseline: results/data_baselines/data_baseline<tag>_<rule>.json.
 """
 from __future__ import annotations
 
@@ -24,7 +25,8 @@ from pathlib import Path
 import numpy as np
 
 import envs
-from cc_common import RESULTS, load_split_episodes, stack_episodes
+import paths
+from common import load_split_episodes, stack_episodes
 from discovery import edge_scores
 from discovery import null_calibration
 from discovery.prune import NEEDS_KNOCKOFF, NEEDS_NULL, NEEDS_NULL_VIF, RULES, prune, vif_delta
@@ -76,7 +78,8 @@ def discover(X, Y, episode, n_splits, label, rule, cross_check=True, data_dir=No
 
 def data_baseline(data_dir, n_splits, rule, split='train'):
     tag = ('' if Path(data_dir).name == 'cc' else f'_{Path(data_dir).name}') + split_tag(split)
-    out = RESULTS / f'data_baseline{tag}_{rule}.json'
+    paths.BASELINES.mkdir(parents=True, exist_ok=True)
+    out = paths.BASELINES / f'data_baseline{tag}_{rule}.json'
     V = stack_episodes(load_split_episodes(data_dir, split))
     print(f'[data baseline, {split}] {len(V["t"])} transitions')
     g = discover(V['inputs'], V['targets'], V['episode'], n_splits, 'data', rule, data_dir=data_dir, split=split)
@@ -139,6 +142,11 @@ def run_checkpoint(ckpt, data_dir, n_splits, base, out_root, rule, probe_only=Fa
     ep, X = E['episode'], E['inputs']
     P = fit_probes.fit_differential(E, seed=0)
     print('  ' + fmt_rep(P['report']), flush=True)
+    if 'z_stoch' in E:                   # DreamerV3: same probe on the stochastic part only (diagnostic)
+        Ez = {**E, 'z': E['z_stoch'], 'z_next': E['z_next_stoch'], 'zhat_next': E['zhat_stoch'],
+              'dzhat_du': E['dzhat_du_stoch']}
+        P['report']['diag_z_only'] = fit_probes.fit_differential(Ez, seed=0, shuffle_control=False)['report']
+        print('  [z only] ' + fmt_rep(P['report']['diag_z_only']), flush=True)
     for n, bins in P['report'].get('R2_by_physics_tercile', {}).items():
         print(f'  {n}: ' + ' | '.join(f'{b} [{v["range"][0]:.2f}-{v["range"][1]:.2f}] pred '
                                       + fmt(TARGET_NAMES, v['R2_predictor']) for b, v in bins.items()))
@@ -176,9 +184,10 @@ def run_checkpoint(ckpt, data_dir, n_splits, base, out_root, rule, probe_only=Fa
         'action_effect_model': {'rows': [env.INPUT_NAMES[c] for c in env.ACTION_COLS], 'cols': TARGET_NAMES,
                                 'values': P['action_effect']},
         'action_effect_expert': effect[env.ACTION_COLS],
-        'history_sensitivity_mean(z_t..z_t-4)': E['hist_sens'].mean(0),
         'graphs': {n: g for n, g in graphs.items() if n != 'data'},
     }
+    if 'hist_sens' in E:                 # JEPA only
+        res['history_sensitivity_mean(z_t..z_t-4)'] = E['hist_sens'].mean(0)
     (out / 'results.json').write_text(json.dumps(jsonable(res), indent=2))
     (out / 'edges.md').write_text(compare.edge_table(graphs, A, tiers, effect, rule))
     compare.heatmaps(graphs, A, tiers, out / 'graphs.png')
@@ -269,16 +278,16 @@ def main():
     a = p.parse_args()
     assert a.split == 'train' or not a.curve, '--curve is only defined for the train split'
     envs.use_data(a.data)
-    RESULTS.mkdir(exist_ok=True)
-    run_name = Path(a.run_dir or Path(a.ckpt).parent.parent).name if (a.run_dir or a.ckpt) else None
+    run_dir = Path(a.run_dir or Path(a.ckpt).parent.parent) if (a.run_dir or a.ckpt) else None
+    run_name = run_dir.name if run_dir else None
     data_tag = ('' if Path(a.data).name == 'cc' else f'_{Path(a.data).name}') + split_tag(a.split)  # e.g. _cc_phys_val
-    out_root = RESULTS / f'{run_name}{data_tag}_diff_{a.prune}' if run_name else None
+    out_root = paths.model_results(run_dir) / f'{run_name}{data_tag}_diff_{a.prune}' if run_name else None
     if a.probe_only:
         assert a.ckpt, '--probe-only needs --ckpt'
         run_checkpoint(a.ckpt, a.data, a.splits, None, out_root, a.prune, probe_only=True, seeds=a.seeds,
                        split=a.split)
         return
-    bpath = RESULTS / f'data_baseline{data_tag}_{a.prune}.json'
+    bpath = paths.BASELINES / f'data_baseline{data_tag}_{a.prune}.json'
     if a.data_baseline or not bpath.exists():
         base = data_baseline(a.data, a.splits, a.prune, a.split)
         print(json.dumps(jsonable(base['vs_expert']), indent=2))

@@ -1,6 +1,6 @@
 """Step 2: generate the frame_skip = 2 cart-pole dataset.
 
-Episode types (counts and lengths in configs/causal_cartpole.yaml):
+Episode types (counts and lengths in configs/envs/cartpole.yaml):
   random       uniform force in [-10, 10] each step (u_t, u_{t-1} uncorrelated)
   prbs         +-amplitude, sign flips with probability pe_flip_prob each step
   passive      u = 0, the pole falls on its own
@@ -11,26 +11,25 @@ passes |theta| > 1.2, so every stored transition is complete and visible.
 Output (per split): episodes/<i>/{observations (T+1,h,w,3) uint8, states (T+1,4),
 actions (T,1)}, attrs trajectory_type; plus metadata.json and summary.json.
 
-Physics: fixed at cc_common.PHYS, or with --vary-physics drawn per episode from physics_ranges
+Physics: fixed at sim.cartpole.PHYS, or with --vary-physics drawn per episode from physics_ranges
 in the config (cart mass M, pole mass m, pole half-length l, gravity g; constant within an
 episode, LQR gain recomputed for it, pole rendered at its true length). Every episode stores its
 physics as attrs phys_M, phys_m, phys_l, phys_g.
 
-Acrobot (--env acrobot, config configs/causal_acrobot.yaml): policies and variables in envs/acrobot.py,
+Acrobot (--env acrobot, config configs/envs/acrobot.yaml): policies and variables in envs/acrobot.py,
 simulator in sim/acrobot.py; episode types random / prbs / passive / swing; physics attrs phys_m1, phys_m2,
 phys_l1, phys_l2, phys_g. metadata.json records the environment ("env"), which every later step reads.
 
 Run:
-  python datagen/generate.py                   # full dataset  -> datasets/cc
-  python datagen/generate.py --small           # smoke-test set -> datasets/cc_small
-  python datagen/generate.py --vary-physics    # varied physics -> datasets/cc_phys
-  python datagen/generate.py --env acrobot --vary-physics [--small]   # -> datasets/ac_phys[_small]
+  python -m datagen.generate                   # full dataset  -> datasets/cc
+  python -m datagen.generate --small           # smoke-test set -> datasets/cc_small
+  python -m datagen.generate --vary-physics    # varied physics -> datasets/cc_phys
+  python -m datagen.generate --env acrobot --vary-physics [--small]   # -> datasets/ac_phys[_small]
 """
 from __future__ import annotations
 
 import argparse
 import json
-import sys
 import time
 from pathlib import Path
 
@@ -39,11 +38,10 @@ import numpy as np
 import scipy.linalg
 import yaml
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from cc_common import DT, HERE, PHYS  # noqa: E402
-from sim.cartpole import CartPole  # noqa: E402
+from envs.cartpole import DT, PHYS
+from paths import DATASETS, ENV_CONFIGS
+from sim.cartpole import CartPole
 
-CFG_PATH = HERE / 'configs' / 'causal_cartpole.yaml'
 TYPES = ('random', 'prbs', 'passive', 'angle_sweep')
 ENV = 'cartpole'                     # set by --env (or by simulate_states(env=...))
 DATASET_PREFIX = {'cartpole': 'cc', 'acrobot': 'ac'}
@@ -55,7 +53,7 @@ def _spec():
 
 
 def load_cfg():
-    return yaml.safe_load((HERE / 'configs' / _spec().CONFIG).read_text())
+    return yaml.safe_load((ENV_CONFIGS / _spec().CONFIG).read_text())
 
 
 def lqr_gain(dt=DT, M=PHYS['M'], m=PHYS['m'], l=PHYS['l'], g=PHYS['g']):
@@ -256,7 +254,7 @@ def main():
     spec = _spec()
     pre = DATASET_PREFIX[a.env]
     name = (f'{pre}_phys' if a.vary_physics else pre) + ('_small' if a.small else '')
-    out = Path(a.out) if a.out else HERE / 'datasets' / name
+    out = Path(a.out) if a.out else DATASETS / name
     out.mkdir(parents=True, exist_ok=True)
     cfg = load_cfg()
     episodes = collect(cfg, render=True, small=a.small, vary_physics=a.vary_physics)

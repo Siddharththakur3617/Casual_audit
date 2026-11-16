@@ -1,6 +1,6 @@
-"""Step 3: train the pixels-only JEPA with a 5-latent predictor history.
+"""Step 3 (JEPA): train the pixels-only JEPA with a 5-latent predictor history.
 
-Losses (weights in configs/causal_cartpole.yaml):
+Losses (weights in configs/models/jepa_<env>.yaml):
   rollout  start from `history` encoded latents, predict the next latent, slide the
            window (drop the oldest, append the prediction), `rollout_steps` times
   inverse  recover the action contexts from the last history latent + rollout targets
@@ -12,7 +12,7 @@ Window layout (horizon = history - 1 + rollout_steps transitions, frames f_0..f_
 Every frame is encoded with its real previous frame.
 The untrained model is saved as checkpoint_epoch0000.pt (lower-bound baseline).
 
-Run: python train_cc.py --data datasets/cc --save-dir runs/jepa_cc
+Run: python -m models.jepa.train --data datasets/cc_phys --config configs/models/jepa_cartpole.yaml --save-dir runs/jepa_cc_phys
 """
 from __future__ import annotations
 
@@ -28,10 +28,10 @@ import torch.nn.functional as F
 import yaml
 from torch.utils.data import DataLoader
 
-from cc_common import HERE
-from datagen.dataset import make_loaders
-from model.jepa import JEPA
-from model.sigreg import sigreg_loss
+from datagen.windows import make_loaders
+from models.jepa.model import JEPA
+from models.jepa.sigreg import sigreg_loss
+from paths import MODEL_CONFIGS
 
 
 def to_float(x, device):
@@ -164,7 +164,7 @@ def run_eval(model, loader, device, cfg, collect=False, max_batches=None):
 def main():
     p = argparse.ArgumentParser()
     p.add_argument('--data', required=True)
-    p.add_argument('--config', default=str(HERE / 'configs' / 'causal_cartpole.yaml'))
+    p.add_argument('--config', default=str(MODEL_CONFIGS / 'jepa_cartpole.yaml'))
     p.add_argument('--save-dir', required=True)
     p.add_argument('--epochs', type=int)
     p.add_argument('--batch-size', type=int)
@@ -191,7 +191,7 @@ def main():
 
     out = Path(args.save_dir)
     (out / 'checkpoints').mkdir(parents=True, exist_ok=True)
-    (out / 'config.yaml').write_text(yaml.safe_dump({'model': mc, 'training': tc}))
+    (out / 'config.yaml').write_text(yaml.safe_dump({'model_type': 'jepa', 'model': mc, 'training': tc}))
     loaders, action_scale = make_loaders(args.data, int(tc['horizon']), int(tc['batch_size']),
                                          int(mc['action_context_dim']), int(tc.get('num_workers', 0)))
 
@@ -218,7 +218,7 @@ def main():
     start, best, history = 1, float('inf'), []
 
     def ckpt(epoch, val_loss):
-        return {'epoch': epoch, 'model': model.state_dict(), 'optimizer': opt.state_dict(),
+        return {'model_type': 'jepa', 'epoch': epoch, 'model': model.state_dict(), 'optimizer': opt.state_dict(),
                 'scheduler': sched.state_dict(), 'model_config': mc, 'training_config': tc,
                 'action_scale': action_scale, 'val_loss': val_loss, 'best_val': best,
                 'bn_recal': recal}

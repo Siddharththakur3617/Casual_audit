@@ -30,8 +30,8 @@ DECOY_SOURCE = [6, 2]              # input NODES copied as shuffled decoys: u_t 
 DECOY_NAMES = ['decoy_u_t', 'decoy_th2']
 ACTION_EPS = 0.03                  # N m (0.1 N on cart-pole's +-10 range, scaled to +-3)
 EXTRA_KEYS = ('true_vel',)
-CONFIG = 'causal_acrobot.yaml'
-RECALIBRATE_BN = True              # BN running stats go stale in training (train_cc.recalibrate_bn)
+CONFIG = 'acrobot.yaml'             # configs/envs/
+RECALIBRATE_BN = True              # BN running stats go stale in training (models/jepa/train.recalibrate_bn)
 POS = [0, 2, 4]                    # state columns of th1, th2, p
 ANGLE = [True, True, False]
 
@@ -41,7 +41,7 @@ def wrap(a):
 
 
 def episode_variables(states, actions, t_min=T_MIN):
-    """states (T+1, 6) = (th1, w1, th2, w2, p, pdot), actions (T,). Same layout as cc_common's."""
+    """states (T+1, 6) = (th1, w1, th2, w2, p, pdot), actions (T,). Same layout as envs/cartpole.py's."""
     states = np.asarray(states, dtype=np.float64)
     u = np.asarray(actions, dtype=np.float64).reshape(-1)
     T = len(u)

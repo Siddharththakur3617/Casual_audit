@@ -1,8 +1,8 @@
 """Cart-pole simulator and renderer (self-contained, no gym / pygame).
 
 Physics: explicit Euler with h = 0.02 s, force held for FRAME_SKIP sub-steps
-(cc_common.macro_step). Default parameters M = 1.0, m = 0.1, l = 0.5 (half-length),
-g = 9.8, no friction.
+(macro_step below). Default parameters M = 1.0, m = 0.1, l = 0.5 (half-length),
+g = 9.8, no friction. The study's variables (vbar, wbar, ...) are in envs/cartpole.py.
 
 Rendering uses the classic cart-pole layout (a 600 x 400 scene, 4.8 m wide, cart
 50 x 30, pole 10 wide and 2l long, axle circle), squeezed to image_size x image_size
@@ -13,7 +13,38 @@ from __future__ import annotations
 
 import numpy as np
 
-from cc_common import FRAME_SKIP, H, PHYS, macro_step
+H = 0.02          # physics sub-step (s), env default
+FRAME_SKIP = 2    # one stored transition = 2 sub-steps = 0.04 s
+PHYS = dict(M=1.0, m=0.1, l=0.5, g=9.8)
+
+
+def accelerations(theta, theta_dot, u, x_dot=0.0, M=1.0, m=0.1, l=0.5, g=9.8,
+                  b_c=0.0, b_p=0.0):
+    """Cart-pole accelerations (Barto et al. 1983 / Florian 2007 form, viscous friction).
+    l is the half-length of the pole; theta = 0 is upright, positive tilts right."""
+    sin_t, cos_t = np.sin(theta), np.cos(theta)
+    total = M + m
+    ml = m * l
+    temp = (u - b_c * x_dot + ml * theta_dot ** 2 * sin_t) / total
+    theta_acc = (g * sin_t - cos_t * temp - b_p * theta_dot / ml) / (
+        l * (4.0 / 3.0 - m * cos_t ** 2 / total))
+    x_acc = temp - ml * theta_acc * cos_t / total
+    return x_acc, theta_acc
+
+
+def euler_substep(s, u, h=H, **phys):
+    """One explicit-Euler sub-step. s: (..., 4) = (x, x_dot, theta, theta_dot)."""
+    s = np.asarray(s, dtype=np.float64)
+    x, xd, th, thd = s[..., 0], s[..., 1], s[..., 2], s[..., 3]
+    xa, tha = accelerations(th, thd, u, x_dot=xd, **phys)
+    return np.stack([x + h * xd, xd + h * xa, th + h * thd, thd + h * tha], axis=-1)
+
+
+def macro_step(s, u, n=FRAME_SKIP, h=H, **phys):
+    """One stored transition: the force is held for n sub-steps."""
+    for _ in range(n):
+        s = euler_substep(s, u, h=h, **phys)
+    return s
 
 SCENE_W, SCENE_H = 600.0, 400.0      # scene units ("screen pixels" of the classic layout)
 WORLD_W = 4.8                        # metres across the scene
@@ -62,7 +93,7 @@ class Renderer:
 class CartPole:
     """reset / step interface. State s = (x, x_dot, theta, theta_dot).
 
-    phys = dict(M, m, l, g) sets the physics (default cc_common.PHYS). It can be changed per
+    phys = dict(M, m, l, g) sets the physics (default PHYS above). It can be changed per
     episode with reset_to_state(state, phys); the pole is drawn with its true length 2l."""
 
     def __init__(self, image_size=128, frame_skip=FRAME_SKIP, action_range=(-10.0, 10.0),

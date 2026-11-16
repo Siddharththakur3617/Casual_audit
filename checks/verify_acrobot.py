@@ -8,9 +8,8 @@
 (e) effect sizes -> final strong/weak tiers
 (f) Markov check: older torques / older states add nothing once the physics is known
 
-Run: python checks/verify_acrobot.py --vary-physics   -> results/checks_ac_phys.json,
-                                                         results/expert_graph_final_ac_phys.json
-     (also: python checks/verify_equations.py --env acrobot --vary-physics)
+Run: python -m checks.verify_acrobot --vary-physics   -> results/expert_graphs/{checks, expert_graph_final}_ac_phys.json
+     (also: python -m checks.verify_equations --env acrobot --vary-physics)
 Without --vary-physics the default physics is used (-> *_ac.json).
 
 Pass bars were fixed before the first run: (a) error < 1e-9; (b) relative drift < 1e-3 at h = 1e-5;
@@ -24,14 +23,13 @@ from __future__ import annotations
 import argparse
 import json
 import sys
-from pathlib import Path
 
 import numpy as np
 import sympy as sp
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-import envs  # noqa: E402
-from cc_common import RESULTS, stack_episodes  # noqa: E402
+import envs
+from common import stack_episodes
+import paths
 
 ENV = envs.use('acrobot')
 from sim.acrobot import (C_DAMP, FRAME_SKIP, H, K_SPRING, PHYS, accelerations, energy,  # noqa: E402
@@ -285,7 +283,7 @@ def check_d_e(V, eps_raw):
     if VARY:
         final['physics'] = {'varied': True, 'ranges': physics_ranges(),
                             'note': 'each transition differentiated at its own episode physics; physics is not a node'}
-    (RESULTS / f'expert_graph_final{SUFFIX}.json').write_text(json.dumps(final, indent=2))
+    (paths.EXPERT / f'expert_graph_final{SUFFIX}.json').write_text(json.dumps(final, indent=2))
 
 
 # ---------------------------------------------------------------- (f)
@@ -321,8 +319,8 @@ def main(argv=None):
     p.add_argument('--env', default='acrobot')
     VARY = p.parse_args(argv).vary_physics
     SUFFIX = '_ac_phys' if VARY else '_ac'
-    RESULTS.mkdir(exist_ok=True)
-    (RESULTS / 'expert_graph_acrobot.json').write_text(json.dumps(
+    paths.EXPERT.mkdir(parents=True, exist_ok=True)
+    (paths.EXPERT / 'expert_graph_acrobot.json').write_text(json.dumps(
         {'inputs': INPUT_NAMES, 'targets': TARGET_NAMES, 'adjacency': ENV.adjacency().tolist(),
          'tiers': ENV.tiers().tolist(), 'why_absent': ENV.WHY}, indent=2))
     check_a()
@@ -334,9 +332,9 @@ def main(argv=None):
     check_c(V)
     check_d_e(V, eps_raw)
     check_f(V)
-    (RESULTS / f'checks{SUFFIX}.json').write_text(json.dumps(REPORT, indent=2, default=str))
+    (paths.EXPERT / f'checks{SUFFIX}.json').write_text(json.dumps(REPORT, indent=2, default=str))
     n_fail = sum(not r['passed'] for r in REPORT.values())
-    print(f'\n{len(REPORT) - n_fail}/{len(REPORT)} checks passed -> results/checks{SUFFIX}.json')
+    print(f'\n{len(REPORT) - n_fail}/{len(REPORT)} checks passed -> results/expert_graphs/checks{SUFFIX}.json')
     sys.exit(1 if n_fail else 0)
 
 

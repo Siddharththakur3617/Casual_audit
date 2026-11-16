@@ -7,7 +7,7 @@ import numpy as np
 from sklearn.metrics import average_precision_score, roc_auc_score
 
 import envs
-from cc_common import RESULTS
+from paths import EXPERT
 
 
 def _names():
@@ -16,16 +16,16 @@ def _names():
 
 
 def expert_path(data_dir=None):
-    """results/expert_graph_final_<dataset>.json for a dataset that has its own expert graph
-    (e.g. cc_phys, from checks/verify_equations.py --vary-physics); the fixed-physics graph otherwise."""
+    """results/expert_graphs/expert_graph_final_<dataset>.json for a dataset that has its own expert graph
+    (e.g. cc_phys, from python -m checks.verify_equations --vary-physics); the fixed-physics graph otherwise."""
     from pathlib import Path
     name = Path(data_dir).name if data_dir else 'cc'
     name = name[:-len('_small')] if name.endswith('_small') else name
     if name == 'cc':
-        return RESULTS / 'expert_graph_final.json'
-    p = RESULTS / f'expert_graph_final_{name}.json'
+        return EXPERT / 'expert_graph_final.json'
+    p = EXPERT / f'expert_graph_final_{name}.json'
     if not p.exists():
-        raise FileNotFoundError(f'{p} is missing: run checks/verify_equations.py'
+        raise FileNotFoundError(f'{p} is missing: run python -m checks.verify_equations'
                                 + (' --vary-physics' if 'phys' in name else '') + ' first')
     return p
 

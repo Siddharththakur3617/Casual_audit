@@ -12,9 +12,9 @@ With h = 0.02 and vbar_t = (x_t - x_{t-1}) / 0.04:
 where a0, a1 are the accelerations at the two sub-steps of a transition.
 
 Tiers here are the hand derivation. checks/verify_equations.py measures the
-actual effect sizes and writes the final tiers to results/expert_graph_final.json.
+actual effect sizes and writes the final tiers to results/expert_graphs/expert_graph_final.json.
 
-Run: python expert_graph.py   -> results/expert_graph.json
+Run: python -m checks.expert_graph   -> results/expert_graphs/expert_graph.json
 """
 from __future__ import annotations
 
@@ -22,7 +22,8 @@ import json
 
 import numpy as np
 
-from cc_common import INPUT_NAMES, RESULTS, TARGET_NAMES
+from envs.cartpole import INPUT_NAMES, TARGET_NAMES
+import paths
 
 # target -> {parent: tier}
 EXPERT = {
@@ -58,7 +59,7 @@ def tiers():
 
 
 def main():
-    RESULTS.mkdir(exist_ok=True)
+    paths.EXPERT.mkdir(parents=True, exist_ok=True)
     A = adjacency()
     out = {
         'inputs': INPUT_NAMES,
@@ -69,7 +70,7 @@ def main():
         'n_absent': int(A.size - A.sum()),
         'why_absent': WHY,
     }
-    (RESULTS / 'expert_graph.json').write_text(json.dumps(out, indent=2))
+    (paths.EXPERT / 'expert_graph.json').write_text(json.dumps(out, indent=2))
     print(f'true edges: {out["n_true"]}, absent: {out["n_absent"]}')
     for j, tgt in enumerate(TARGET_NAMES):
         print(f'  {tgt:7s} <- ' + ', '.join(f'{p} ({t})' for p, t in EXPERT[tgt].items()))

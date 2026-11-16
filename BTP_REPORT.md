@@ -338,16 +338,25 @@ flowchart LR
         A2 --> A3["Probe and graph,<br/>epoch 200 and 0"]
         A3 --> A5["Probe on<br/>unseen episodes"]
     end
+    subgraph DR["DreamerV3 (second world model)"]
+        D1["Port + smoke test"] --> D2["Training on<br/>cc_phys, ac_phys"]
+        D2 --> D3["Probe and graph,<br/>epoch 500 and 0"]
+        D3 --> D4["21-checkpoint<br/>curve"]
+    end
     CP --> X["Interchange<br/>interventions"]
     AC --> X
+    CP --> DR
+    AC --> DR
     classDef done fill:#d4edda,stroke:#2e7d32,color:#000
     classDef running fill:#fff3cd,stroke:#b8860b,color:#000
     classDef todo fill:#eeeeee,stroke:#777,color:#000
-    class C1,A1,A2,A3,A5 done
-    class C2,C3,X todo
+    class C1,A1,A2,A3,A5,D1 done
+    class C2,C3,X,D2,D3,D4 todo
 ```
 
 Green = done, grey = to do. The Acrobot training curve is postponed.
+
+**DreamerV3 (2026-11-13).** The same test on a second, generative world model. DreamerV3 is trained offline on the same datasets (`cc_phys`, `ac_phys`), so the expert graphs, rows, nulls and data baselines are the ones above, and its graphs compare one to one with the JEPA's. It is a PyTorch port of the official world model (preset `size12m`, 7.7M parameters, 128×128 frames, no reward or policy heads). The probe reads its full state [h, z]: the prediction is the prior at t+1, the encoder control the posterior at t+1. Both share h(t+1), so a z-only probe is reported as a diagnostic. Settings were fixed before any result (README, "DreamerV3").
 
 ## References
 

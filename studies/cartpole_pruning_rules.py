@@ -13,8 +13,8 @@ Model graphs (differential probe, true-state inputs): encoder and predictor at t
 Every graph is scored once with shuffled decoys and once with knockoff decoys (50 splits each); all
 rules are then applied to the same scores. Scores are cached, so the script resumes after a crash.
 
-  python compare_pruning.py --data datasets/cc_phys --run-dir runs/jepa_cc
-Output: results/pruning_comparison_<data>_<run>/{report.md, comparison.json, scores/*.json, probe/*.npz}
+  python -m studies.cartpole_pruning_rules --data datasets/cc_phys --run-dir runs/jepa_cc_phys
+Output: results/studies/pruning_comparison_<data>_<run>/{report.md, comparison.json, scores/*.json, probe/*.npz}
 """
 from __future__ import annotations
 
@@ -26,7 +26,9 @@ from pathlib import Path
 import numpy as np
 from sklearn.metrics import roc_auc_score
 
-from cc_common import INPUT_NAMES, RESULTS, TARGET_NAMES, load_split_episodes, stack_episodes
+from common import load_split_episodes, stack_episodes
+from envs.cartpole import INPUT_NAMES, TARGET_NAMES
+from paths import STUDIES
 from discovery import edge_scores, null_calibration, prune as pr
 from evaluate import compare
 from probing import fit_probes
@@ -112,7 +114,7 @@ def main():
     p.add_argument('--out', default=None, help='output folder (default results/pruning_comparison_<data>_<run>)')
     a = p.parse_args()
     global OUT
-    OUT = Path(a.out) if a.out else RESULTS / f'pruning_comparison_{Path(a.data).name}_{Path(a.run_dir).name}'
+    OUT = Path(a.out) if a.out else STUDIES / f'pruning_comparison_{Path(a.data).name}_{Path(a.run_dir).name}'
     OUT.mkdir(parents=True, exist_ok=True)
     A, tiers, effect = compare.load_expert(a.data)
     expert_file = compare.expert_path(a.data).name

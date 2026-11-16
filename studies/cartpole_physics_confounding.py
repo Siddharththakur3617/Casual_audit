@@ -1,12 +1,12 @@
 """Is the hidden per-episode physics confounding the true-data graph on a varied-physics dataset?
 
 The expert graph holds physics fixed (Jacobian at each row's own M, m, l, g); the 'data' graph of
-compare_pruning.py averages over hidden physics. If inputs stand in for physics, absent edges can
+studies/cartpole_pruning_rules.py averages over hidden physics. If inputs stand in for physics, absent edges can
 look real (suspects on cc_phys: vbar->dwbar kept by most rules; wbar->dwbar fitted effect 1.17 vs
 expert 0.09). Following CD-NOD (Huang et al. 2020, a domain index as a conditioning variable),
 the true-data graph is scored three ways, same rows, seeds and splits:
 
-  data          no physics (the cached compare_pruning score)
+  data          no physics (the cached cartpole_pruning_rules score)
   data_phys     the episode's (M, m, l, g) given to every fit as conditioning inputs (not nodes)
   data_physshuf the same four columns permuted across episodes: control for "four extra inputs"
 
@@ -15,8 +15,8 @@ null_cal_fwer threshold with true physics but not with shuffled physics. The nul
 was computed without conditioning columns, so the rule columns for data_phys are approximate;
 the effect sizes (Jacobian, D) are the main readout.
 
-  python diagnose_physics.py --data datasets/cc_phys --run-dir runs/jepa_cc_phys
-Output: results/physics_conditioning_<data>/{report.md, scores/*.json}
+  python -m studies.cartpole_physics_confounding --data datasets/cc_phys --run-dir runs/jepa_cc_phys
+Output: results/studies/physics_conditioning_<data>/{report.md, scores/*.json}
 """
 from __future__ import annotations
 
@@ -26,8 +26,10 @@ from pathlib import Path
 
 import numpy as np
 
-from cc_common import INPUT_NAMES, PHYS_KEYS, RESULTS, TARGET_NAMES, load_split_episodes, stack_episodes
-from compare_pruning import load_scores
+from common import load_split_episodes, stack_episodes
+from envs.cartpole import INPUT_NAMES, PHYS_KEYS, TARGET_NAMES
+from paths import STUDIES
+from studies.cartpole_pruning_rules import load_scores
 from discovery import edge_scores, null_calibration, prune as pr
 from evaluate import compare
 from run_all import jsonable
@@ -53,12 +55,12 @@ def scored(out, name, X, Y, ep, n_splits, cond):
 def main():
     p = argparse.ArgumentParser()
     p.add_argument('--data', required=True)
-    p.add_argument('--run-dir', required=True, help='only to find the cached compare_pruning data score')
+    p.add_argument('--run-dir', required=True, help='only to find the cached cartpole_pruning_rules data score')
     p.add_argument('--splits', type=int, default=50)
     p.add_argument('--out', default=None)
     a = p.parse_args()
     name = Path(a.data).name
-    out = Path(a.out) if a.out else RESULTS / f'physics_conditioning_{name}'
+    out = Path(a.out) if a.out else STUDIES / f'physics_conditioning_{name}'
     out.mkdir(parents=True, exist_ok=True)
     A, tiers, effect = compare.load_expert(a.data)
 
@@ -66,7 +68,7 @@ def main():
     X, Y, ep = V['inputs'], V['targets'], V['episode']
     assert P.std(0).max() > 0, 'dataset has fixed physics: nothing to condition on'
     perm = np.random.default_rng(4321).permutation(len(P))           # shuffle physics across episodes
-    cached = RESULTS / f'pruning_comparison_{name}_{Path(a.run_dir).name}' / 'scores' / 'data_shuffled.json'
+    cached = STUDIES / f'pruning_comparison_{name}_{Path(a.run_dir).name}' / 'scores' / 'data_shuffled.json'
     S = {'data': load_scores(cached) if (cached.exists() and a.splits == 50 and not a.out)
          else scored(out, 'data', X, Y, ep, a.splits, None),
          'data_phys': scored(out, 'data_phys', X, Y, ep, a.splits, P[ep]),

@@ -1,6 +1,5 @@
-# Acrobot causal-structure study (env: acrobot, envs/acrobot.py, sim/acrobot.py).
-# environment + data: used by datagen/generate.py --env acrobot
-# model + training:   used by train_cc.py --config configs/causal_acrobot.yaml (same as cart-pole)
+# Acrobot: environment, physics ranges and dataset policies (envs/acrobot.py, sim/acrobot.py).
+# Read by datagen/generate.py --env acrobot and by the checks (physics_ranges).
 
 environment:
   frame_skip: 4          # one transition = 4 Euler sub-steps of 0.01 s = 0.04 s
@@ -46,47 +45,3 @@ data:
   # distractor initial state (amplitude at most ~1.8 m, track is +-3.8 m)
   distractor_init_pos: 1.5
   distractor_init_vel: 3.0
-
-model:
-  action_context_dim: 2      # [u_{t-1}, u_t]
-  use_action_history: true
-  history_size: 5
-  image_size: 128
-  patch_size: 8
-  latent_dim: 192
-  use_frame_diff: true
-  use_proprio: false         # pixels only
-  vit_depth: 4
-  vit_embed_dim: 192
-  vit_heads: 3
-  predictor_depth: 6
-  predictor_dim_head: 64
-  predictor_dropout: 0.1
-  predictor_heads: 16
-  predictor_hidden_dim: 192
-  predictor_mlp_dim: 2048
-  use_inverse_model: true
-  inverse_hidden_dim: 256
-  inverse_seq_len: 4
-
-training:
-  history: 5
-  rollout_steps: 3
-  horizon: 7
-  batch_size: 64
-  epochs: 200
-  lr: 0.0001
-  min_lr: 1.0e-06
-  warmup_epochs: 5
-  weight_decay: 0.001
-  normalize_actions: true
-  lambda_fwd: 0.0
-  lambda_inverse: 1.0
-  lambda_rollout: 1.0
-  lambda_sigreg: 1.0
-  sigreg_num_points: 17
-  sigreg_num_slices: 128
-  sigreg_variance_floor_weight: 0.0
-  num_workers: 0
-  checkpoint_every: 10
-  probe_every: 10

@@ -19,6 +19,7 @@ A world model is trained on rendered frames only (no state input). We read a cau
 | Rule check on fixed physics (`datasets/cc`) | **to do** | — |
 | Counterfactual queries (JEPA, epoch 200; `docs/counterfactual_study.md`) | done | done |
 | Interchange interventions | **to do** | **to do** |
+| Graph prior during training (masked attention, Jacobian penalty; see below) | code written, **not run** | — |
 
 ## Method in one paragraph
 
@@ -46,17 +47,18 @@ causal_structure_cartpole/
 ├── envs/               environment registry: variables, names, graph layout (cartpole.py, acrobot.py)
 ├── sim/                simulators and renderers (cartpole.py, acrobot.py)
 ├── checks/             Step 1: equation checks and the expert graph (verify_equations.py, verify_acrobot.py,
-│                       expert_graph.py = hand-derived cart-pole graph)
+│                       expert_graph.py = hand-derived cart-pole graph); verify_graph_mask.py (graph-prior wiring)
 ├── datagen/            Step 2: generate.py (datasets), windows.py (JEPA training windows),
 │                       episodes.py (whole-episode batches for DreamerV3)
 ├── models/
-│   ├── jepa/           model.py, sigreg.py, train.py
+│   ├── jepa/           model.py, sigreg.py, train.py, graph.py (slot layout + expert-graph mask)
 │   └── dreamer/        model.py (DreamerV3 world model + LaProp optimizer), train.py
 ├── probing/            Step 4: extract.py (picks the extractor by model type), extract_jepa.py,
 │                       extract_dreamer.py, fit_probes.py (differential probe)
 ├── discovery/          Steps 5-6: edge_scores.py (LOCO + decoys), prune.py (pruning rules),
 │                       null_calibration.py (shuffled-target repeats)
-├── evaluate/           Step 7: compare.py (comparison with the expert graph, tables, plots)
+├── evaluate/           Step 7: compare.py (comparison with the expert graph, tables, plots);
+│                       compare_training.py (standard vs graph-prior JEPA training runs)
 ├── counterfactual/     counterfactual queries: queries.py (windows, re-solved interventions, simulation,
 │                       GPU renderer), model_jepa.py, scm.py (graph-restricted SCMs), metrics.py
 ├── studies/            side studies: cartpole_pruning_rules.py (rule comparison, report §6),
@@ -178,6 +180,32 @@ foreach ($d in @(@("cc_phys", "jepa_cc_phys"), @("ac_phys", "jepa_ac_phys"))) {
 ```
 
 Smoke test: `--data datasets/cc_small --ckpt runs/_smoke/jepa_cc_small/checkpoints/checkpoint_epoch0001.pt --graph expert --windows 60` (`--graph expert` stands in for a recovered graph the smoke run does not have).
+
+### Graph prior during training (cart-pole JEPA)
+
+Does giving the JEPA the expert graph while it trains make training more efficient? Plan and design reasons: `docs/graph_prior_training_plan.md`. Both graph arms keep the encoder, rollout loss, inverse model and SIGReg. They split z into slots `[x | v̄ | θ | ω̄ | ctx]` (40/40/40/40/32; ctx is meant for hidden physics), with parents from `checks/expert_graph.py` (strong + weak edges, `models/jepa/graph.py`):
+
+- **masked** (`jepa_cartpole_graphmask.yaml`): tokens are (time, slot), and attention is masked so a slot reads only its parents, itself and ctx (`GraphMaskedPredictor` in `models/jepa/model.py`).
+- **jacobian** (`jepa_cartpole_graphjac.yaml`): the standard predictor, plus a finite-difference penalty on the sensitivity of predicted slot j to every non-parent slot i (`lambda_jac`, in `models/jepa/train.py`).
+
+Both arms also use `lambda_ctx`, which keeps ctx constant within a window. The only absent state edges are x→v̄, x→θ, x→ω̄, v̄→θ and v̄→ω̄, so a small or null in-distribution gain is a possible outcome.
+
+```powershell
+& $PY -m checks.verify_graph_mask                       # CPU, no data: mask, shapes, penalty estimator
+# smoke (1 epoch on datasets/cc_small)
+& $PY -m models.jepa.train --data datasets/cc_small --config configs/models/jepa_cartpole_graphmask.yaml --save-dir runs/_smoke/jepa_gmask --epochs 1
+& $PY -m models.jepa.train --data datasets/cc_small --config configs/models/jepa_cartpole_graphjac.yaml  --save-dir runs/_smoke/jepa_gjac  --epochs 1
+# main comparison, 100 epochs, seed 42 (~1.75 h each)
+& $PY -m models.jepa.train --data datasets/cc_phys --config configs/models/jepa_cartpole.yaml           --save-dir runs/jepa_cc_phys_e100       --epochs 100 --probe-every 5
+& $PY -m models.jepa.train --data datasets/cc_phys --config configs/models/jepa_cartpole_graphmask.yaml --save-dir runs/jepa_cc_phys_gmask_e100
+& $PY -m models.jepa.train --data datasets/cc_phys --config configs/models/jepa_cartpole_graphjac.yaml  --save-dir runs/jepa_cc_phys_gjac_e100
+foreach ($r in "jepa_cc_phys_e100", "jepa_cc_phys_gmask_e100", "jepa_cc_phys_gjac_e100") {
+  & $PY run_all.py --data datasets/cc_phys --run-dir runs/$r --curve --splits 20 --prune null_cal_fwer
+}
+& $PY -m evaluate.compare_training --data datasets/cc_phys --runs runs/jepa_cc_phys_e100 runs/jepa_cc_phys_gmask_e100 runs/jepa_cc_phys_gjac_e100 --labels standard masked jacobian
+```
+
+Outputs: `results/studies/graph_prior_training/` (`training.png`, `probe_r2.png`, `rollout.png`, `graph.png`, `summary.md`, `summary.json`). Each `history.json` row now also has `train_s` and `wall_s`. Slot-layout runs also log `graph_sensitivity_val` on probe epochs. Optional second seed: rerun the baseline and the better arm with `--seed 43` into new run dirs.
 
 ### Cart-pole, fixed physics (first model)
 

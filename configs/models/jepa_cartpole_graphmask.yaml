@@ -1,0 +1,55 @@
+# JEPA on cart-pole, graph-prior arm M: predictor attention masked by the expert graph.
+# Same as jepa_cartpole.yaml except the slot layout, predictor_type and lambda_ctx (100 epochs, probe every 5).
+# Used by: python -m models.jepa.train --config configs/models/jepa_cartpole_graphmask.yaml
+
+model:
+  action_context_dim: 2      # [u_{t-1}, u_t]
+  use_action_history: true
+  history_size: 5            # predictor sees z_{t-4..t}
+  image_size: 128
+  patch_size: 8
+  latent_dim: 192
+  use_frame_diff: true
+  use_proprio: false         # pixels only
+  vit_depth: 4
+  vit_embed_dim: 192
+  vit_heads: 3
+  predictor_depth: 6
+  predictor_dim_head: 64
+  predictor_dropout: 0.1
+  predictor_heads: 16
+  predictor_hidden_dim: 192
+  predictor_mlp_dim: 2048
+  use_inverse_model: true
+  inverse_hidden_dim: 256
+  inverse_seq_len: 4         # last history latent + 3 rollout latents
+  # graph prior: z = [x | vbar | theta | wbar | ctx], mask from checks/expert_graph.py (models/jepa/graph.py)
+  slot_names: [x, vbar, theta, wbar, ctx]
+  slot_sizes: [40, 40, 40, 40, 32]
+  graph_edges: strong_weak   # strong + weak edges (a missing true edge hurts more than an extra one)
+  predictor_type: graph_masked
+  slot_projector_hidden: 512   # per-slot BatchNorm projector (replaces the dense 2048 one)
+
+training:
+  history: 5                 # encoded latents given to the predictor
+  rollout_steps: 3
+  horizon: 7                 # loader window in transitions = history - 1 + rollout_steps
+  batch_size: 64
+  epochs: 100
+  lr: 0.0001
+  min_lr: 1.0e-06
+  warmup_epochs: 5
+  weight_decay: 0.001
+  normalize_actions: true
+  lambda_fwd: 0.0
+  lambda_inverse: 1.0
+  lambda_rollout: 1.0
+  lambda_sigreg: 1.0
+  sigreg_num_points: 17
+  sigreg_num_slices: 128
+  sigreg_variance_floor_weight: 0.0
+  lambda_jac: 0.0
+  lambda_ctx: 0.1            # ctx slot constant within a window; pick from {0.1, 1.0}
+  num_workers: 0
+  checkpoint_every: 10
+  probe_every: 5

@@ -9,12 +9,19 @@ Inverse model: MLP from a short latent sequence to the actions between them
 
 Same architecture as the JEPA_control cart-pole model (patch 8, ViT 4x192,
 predictor 6 blocks, hidden 192, 16 heads x 64, MLP 2048).
+
+Graph-prior variant (predictor_type: graph_masked): the same predictor blocks, but z is split
+into slots [x | vbar | theta | wbar | ctx] and attention is masked so a slot only reads its
+expert-graph parents, itself and ctx (models/jepa/graph.py). Encoder, losses, inverse model
+and SIGReg are unchanged, and encode/predict keep their shapes, so probing works as before.
 """
 from __future__ import annotations
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+from models.jepa import graph
 
 
 class PatchViTEncoder(nn.Module):
@@ -71,13 +78,14 @@ class ConditionalBlock(nn.Module):
         nn.init.zeros_(self.adaln[-1].weight)
         nn.init.zeros_(self.adaln[-1].bias)
 
-    def forward(self, x, c):
+    def forward(self, x, c, attn_mask=None):
+        """attn_mask: optional (t, t) bool, True = may attend. None = plain causal mask."""
         s1, k1, g1, s2, k2, g2 = self.adaln(c).chunk(6, dim=-1)
         q = modulate(self.norm1(x), s1, k1)
         b, t, _ = q.shape
         q, k, v = (y.reshape(b, t, self.heads, self.dim_head).transpose(1, 2)
                    for y in self.to_qkv(q).chunk(3, dim=-1))
-        h = F.scaled_dot_product_attention(q, k, v, is_causal=True,
+        h = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask, is_causal=attn_mask is None,
                                            dropout_p=self.dropout if self.training else 0.)
         x = x + g1 * self.to_out(h.transpose(1, 2).reshape(b, t, -1))
         return x + g2 * self.mlp(modulate(self.norm2(x), s2, k2))
@@ -107,6 +115,60 @@ class ARPredictor(nn.Module):
         return self.pred_projector(x.reshape(b * t, d)).reshape(b, t, d)
 
 
+class GraphMaskedPredictor(nn.Module):
+    """ARPredictor with one token per (time, slot) and attention masked by the expert graph.
+
+    z is split into slots (models/jepa/graph.py). Token (t, j) may attend to token (t', i) iff
+    t' <= t and mask[j, i]. Everything that maps between tokens is per slot: input projection,
+    output projection and the BatchNorm projector, so slot j's prediction depends only on the
+    slots it is allowed to read. Actions condition every token of their time step through the
+    same AdaLN-zero blocks as ARPredictor; the graph gives every change both action parents.
+    Input and output shapes match ARPredictor: (b, t, latent_dim).
+    """
+
+    def __init__(self, slot_sizes, mask, latent_dim=192, hidden_dim=192, history_size=5, depth=6,
+                 heads=16, dim_head=64, mlp_dim=2048, dropout=.1, projector_hidden=512):
+        super().__init__()
+        self.sizes = [int(s) for s in slot_sizes]
+        assert sum(self.sizes) == latent_dim
+        K = self.K = len(self.sizes)
+        self.history_size = int(history_size)
+        self.in_proj = nn.ModuleList([nn.Linear(s, hidden_dim) for s in self.sizes])
+        self.cond_proj = nn.Linear(latent_dim, hidden_dim) if latent_dim != hidden_dim else nn.Identity()
+        self.time_pos = nn.Parameter(torch.randn(1, history_size, 1, hidden_dim) * .02)
+        self.slot_emb = nn.Parameter(torch.randn(1, 1, K, hidden_dim) * .02)
+        self.blocks = nn.ModuleList([ConditionalBlock(hidden_dim, heads, dim_head, mlp_dim, dropout)
+                                     for _ in range(depth)])
+        self.norm = nn.LayerNorm(hidden_dim)
+        self.out_proj = nn.ModuleList([nn.Linear(hidden_dim, s) for s in self.sizes])
+        self.pred_projector = nn.ModuleList([
+            nn.Sequential(nn.Linear(s, projector_hidden), nn.BatchNorm1d(projector_hidden), nn.GELU(),
+                          nn.Linear(projector_hidden, s)) for s in self.sizes])
+        # token order is time-major (index = t * K + k), so the mask for a shorter history is a
+        # leading square block of the full one
+        m = torch.as_tensor(mask, dtype=torch.bool)
+        T = self.history_size
+        tt = torch.arange(T)
+        time_ok = tt[:, None] >= tt[None, :]                         # query time >= key time
+        full = time_ok[:, None, :, None] & m[None, :, None, :]       # (T, K, T, K)
+        self.register_buffer('attn_mask', full.reshape(T * K, T * K), persistent=False)
+
+    def forward(self, z, a_emb):
+        b, t, _ = z.shape
+        K = self.K
+        parts = torch.split(z, self.sizes, dim=-1)
+        x = torch.stack([p(zk) for p, zk in zip(self.in_proj, parts)], dim=2)   # (b, t, K, h)
+        x = (x + self.time_pos[:, :t] + self.slot_emb).reshape(b, t * K, -1)
+        c = self.cond_proj(a_emb)[:, :, None].expand(-1, -1, K, -1).reshape(b, t * K, -1)
+        mask = self.attn_mask[:t * K, :t * K]
+        for blk in self.blocks:
+            x = blk(x, c, attn_mask=mask)
+        x = self.norm(x).reshape(b, t, K, -1)
+        out = [proj(op(x[:, :, k]).reshape(b * t, -1)).reshape(b, t, -1)
+               for k, (op, proj) in enumerate(zip(self.out_proj, self.pred_projector))]
+        return torch.cat(out, dim=-1)
+
+
 class InverseModel(nn.Module):
     """seq_len latents -> the seq_len-1 action contexts between them."""
 
@@ -133,12 +195,23 @@ class JEPA(nn.Module):
             in_channels=9, embed_dim=int(cfg.get('vit_embed_dim', 192)),
             depth=int(cfg.get('vit_depth', 4)), heads=int(cfg.get('vit_heads', 3)), latent_dim=d)
         self.action_encoder = ActionEmbedder(self.action_context_dim, d)
-        self.predictor = ARPredictor(
-            latent_dim=d, hidden_dim=int(cfg.get('predictor_hidden_dim', 192)),
-            history_size=self.history_size, depth=int(cfg.get('predictor_depth', 6)),
-            heads=int(cfg.get('predictor_heads', 16)), dim_head=int(cfg.get('predictor_dim_head', 64)),
-            mlp_dim=int(cfg.get('predictor_mlp_dim', 2048)),
-            dropout=float(cfg.get('predictor_dropout', .1)))
+        # slot layout + expert-graph mask (None for the standard JEPA without a slot layout)
+        self.graph_spec = graph.graph_spec(self.cfg, d)
+        self.predictor_type = cfg.get('predictor_type', 'transformer')
+        common = dict(latent_dim=d, hidden_dim=int(cfg.get('predictor_hidden_dim', 192)),
+                      history_size=self.history_size, depth=int(cfg.get('predictor_depth', 6)),
+                      heads=int(cfg.get('predictor_heads', 16)),
+                      dim_head=int(cfg.get('predictor_dim_head', 64)),
+                      mlp_dim=int(cfg.get('predictor_mlp_dim', 2048)),
+                      dropout=float(cfg.get('predictor_dropout', .1)))
+        if self.predictor_type == 'graph_masked':
+            self.predictor = GraphMaskedPredictor(
+                self.graph_spec['sizes'], self.graph_spec['mask'],
+                projector_hidden=int(cfg.get('slot_projector_hidden', 512)), **common)
+        elif self.predictor_type == 'transformer':
+            self.predictor = ARPredictor(**common)
+        else:
+            raise ValueError(f'unknown predictor_type {self.predictor_type!r}')
         self.inverse_model = (InverseModel(d, self.action_context_dim,
                                            int(cfg.get('inverse_hidden_dim', 256)),
                                            int(cfg.get('inverse_seq_len', 4)))

@@ -6,6 +6,11 @@ Losses (weights in configs/models/jepa_<env>.yaml):
   inverse  recover the action contexts from the last history latent + rollout targets
   sigreg   keep latents close to an isotropic Gaussian (prevents collapse)
   fwd      optional teacher-forced one-step loss at every history position (off by default)
+  jac      graph-prior arm: finite-difference sensitivity of each predicted slot to a slot the
+           expert graph says is not its parent (needs a slot layout; models/jepa/graph.py)
+  ctx      graph-prior arms: the ctx slot (hidden physics) should not change within a window
+Each epoch row of history.json also records train_s (optimisation seconds) and wall_s (cumulative);
+models with a slot layout also log graph_sensitivity_val on probe epochs.
 
 Window layout (horizon = history - 1 + rollout_steps transitions, frames f_0..f_H):
   history latents f_0 .. f_{history-1}; rollout targets f_history .. f_H.
@@ -56,8 +61,49 @@ def action_contexts(model, batch, device):
     return a.unfold(1, ctx, 1).reshape(a.shape[0], -1, ctx)
 
 
+def block_masks(spec, pairs, d, device):
+    """(P, d) 0/1 masks of the input block i and output block j of each (i, j) pair."""
+    ins, outs = torch.zeros(len(pairs), d, device=device), torch.zeros(len(pairs), d, device=device)
+    for p, (i, j) in enumerate(pairs):
+        ins[p, spec['slices'][i]] = 1.
+        outs[p, spec['slices'][j]] = 1.
+    return ins, outs
+
+
+def edge_sensitivity(model, zh, ah, spec, pairs, sigma, pair_idx=None):
+    """Finite-difference sensitivity of predicted slot j to slot i, per sample.
+
+    Adds noise delta (sigma x batch std of each dim of block i) to block i at every history
+    position and returns ||zhat_j(z + delta) - zhat_j(z)||^2 / ||delta||^2, an estimate of
+    ||d zhat_j / d z_i||_F^2 / n_i. pair_idx (b,) picks one pair per sample; None = every pair,
+    returning (P, b). zh is detached, so the penalty shapes the predictor, not the encoder.
+    Both passes run with the predictor in eval mode: dropout off, and BatchNorm on running
+    statistics, since train-mode batch statistics would spread the perturbation to every slot.
+    """
+    zh = zh.detach()
+    b, t, d = zh.shape
+    ins, outs = block_masks(spec, pairs, d, zh.device)
+    std = zh.reshape(-1, d).std(0).clamp_min(1e-6)
+    was = model.predictor.training
+    model.predictor.eval()
+    try:
+        p0 = model.predict(zh, ah)[:, -1]
+        rows = range(len(pairs)) if pair_idx is None else [None]
+        res = []
+        for r in rows:
+            im, om = (ins[pair_idx], outs[pair_idx]) if r is None else (ins[r].expand(b, -1), outs[r].expand(b, -1))
+            delta = torch.randn_like(zh) * (sigma * std) * im[:, None, :]
+            p1 = model.predict(zh + delta, ah)[:, -1]
+            num = ((p1 - p0) ** 2 * om).sum(-1)
+            res.append(num / (delta ** 2).sum((1, 2)).clamp_min(1e-12))
+    finally:
+        model.predictor.train(was)
+    return res[0] if pair_idx is not None else torch.stack(res)
+
+
 def losses(model, batch, device, cfg):
     hist, steps = cfg['history'], cfg['rollout_steps']
+    spec = model.graph_spec
     z = encode_window(model, batch, device)                  # (b, hist+steps, d)
     a = action_contexts(model, batch, device)                # (b, hist+steps-1, ctx)
     zero = z.new_zeros(())
@@ -83,9 +129,57 @@ def losses(model, batch, device, cfg):
         sig = sigreg_loss(z.reshape(-1, z.shape[-1]), num_slices=cfg['sigreg_num_slices'],
                           num_points=cfg['sigreg_num_points'])
 
+    jac = zero                       # Jacobian sparsity: predicted slot j must not move with non-parent i
+    if cfg['lambda_jac'] > 0:
+        assert spec is not None and spec['non_edges'], 'lambda_jac needs a slot layout with absent edges'
+        pairs = spec['non_edges']
+        idx = torch.randint(len(pairs), (z.shape[0],), device=z.device)
+        jac = edge_sensitivity(model, z[:, :hist], a[:, :hist], spec, pairs, cfg['jac_sigma'], idx).mean()
+
+    ctx = zero                       # hidden physics are constant within an episode: ctx should be too
+    if cfg['lambda_ctx'] > 0:
+        assert spec is not None and spec['ctx'] is not None, 'lambda_ctx needs a ctx slot'
+        c = z[..., spec['slices'][spec['ctx']]]
+        ctx = F.mse_loss(c[:, 1:], c[:, :-1])
+
     total = (cfg['lambda_rollout'] * rl + cfg['lambda_fwd'] * fwd
-             + cfg['lambda_inverse'] * inv + cfg['lambda_sigreg'] * sig)
-    return total, torch.stack([total, rl, fwd, inv, sig]).detach(), z[:, hist - 1]
+             + cfg['lambda_inverse'] * inv + cfg['lambda_sigreg'] * sig
+             + cfg['lambda_jac'] * jac + cfg['lambda_ctx'] * ctx)
+    return total, torch.stack([total, rl, fwd, inv, sig, jac, ctx]).detach(), z[:, hist - 1]
+
+
+LOSS_NAMES = ['loss', 'rollout', 'fwd', 'inv', 'sig', 'jac', 'ctx']
+
+
+@torch.no_grad()
+def graph_diagnostic(model, loader, device, cfg, max_batches=20, sigma=0.1):
+    """Mean sensitivity of predicted slots to non-parent and to parent slots on a loader.
+    Only defined for models with a slot layout. ~0 non-parent for graph_masked by construction."""
+    spec = model.graph_spec
+    if spec is None:
+        return None
+    model.eval()
+    hist = cfg['history']
+    sums = {'non': torch.zeros(len(spec['non_edges']), device=device),
+            'par': torch.zeros(len(spec['parent_edges']), device=device)}
+    n = 0
+    with torch.random.fork_rng(devices=[torch.cuda.current_device()] if device.type == 'cuda' else []):
+        torch.manual_seed(0)                      # same noise every epoch; caller's RNG untouched
+        for k, batch in enumerate(loader):
+            if k >= max_batches:
+                break
+            z = encode_window(model, batch, device)
+            a = action_contexts(model, batch, device)
+            for key, pairs in (('non', spec['non_edges']), ('par', spec['parent_edges'])):
+                if pairs:
+                    sums[key] += edge_sensitivity(model, z[:, :hist], a[:, :hist], spec, pairs, sigma).sum(1)
+            n += z.shape[0]
+    nm = spec['names']
+    non, par = (sums['non'] / max(n, 1)).cpu().numpy(), (sums['par'] / max(n, 1)).cpu().numpy()
+    return {'nonparent_mean': float(non.mean()) if len(non) else 0.,
+            'parent_mean': float(par.mean()) if len(par) else 0.,
+            'nonparent': {f'{nm[i]}->{nm[j]}': float(v) for (i, j), v in zip(spec['non_edges'], non)},
+            'parent': {f'{nm[i]}->{nm[j]}': float(v) for (i, j), v in zip(spec['parent_edges'], par)}}
 
 
 def ridge_r2(z_tr, y_tr, z_te, y_te, ridge=1e-3):
@@ -102,8 +196,9 @@ BN_RECAL_BATCHES = 200
 def loss_cfg(tc):
     """Loss settings from a training config block (as used by losses())."""
     cfg = {k: float(tc.get(k, 0.0)) for k in ('lambda_fwd', 'lambda_inverse', 'lambda_rollout',
-                                              'lambda_sigreg')}
+                                              'lambda_sigreg', 'lambda_jac', 'lambda_ctx')}
     cfg.update(history=int(tc['history']), rollout_steps=int(tc['rollout_steps']),
+               jac_sigma=float(tc.get('jac_sigma', 0.1)),
                sigreg_num_slices=int(tc.get('sigreg_num_slices', 128)),
                sigreg_num_points=int(tc.get('sigreg_num_points', 17)))
     return cfg
@@ -148,7 +243,7 @@ def recalibrate_bn(model, dataset, device, cfg, batch_size, n_batches=BN_RECAL_B
 @torch.no_grad()
 def run_eval(model, loader, device, cfg, collect=False, max_batches=None):
     model.eval()
-    tot, n, zs, ys = np.zeros(5), 0, [], []
+    tot, n, zs, ys = np.zeros(len(LOSS_NAMES)), 0, [], []
     for i, batch in enumerate(loader):
         if max_batches and i >= max_batches:
             break
@@ -171,6 +266,7 @@ def main():
     p.add_argument('--seed', type=int, default=42)
     p.add_argument('--device', default='cuda')
     p.add_argument('--resume', default=None, help='checkpoint to continue from')
+    p.add_argument('--probe-every', type=int, help='epochs between R² probes / graph diagnostics')
     args = p.parse_args()
 
     torch.manual_seed(args.seed); np.random.seed(args.seed)
@@ -185,6 +281,9 @@ def main():
         tc['epochs'] = args.epochs
     if args.batch_size is not None:
         tc['batch_size'] = args.batch_size
+    if args.probe_every is not None:
+        tc['probe_every'] = args.probe_every
+    tc['seed'] = args.seed
     hist, steps = int(tc['history']), int(tc['rollout_steps'])
     assert int(mc['history_size']) == hist, 'model.history_size must equal training.history'
     assert int(tc['horizon']) == hist - 1 + steps, 'horizon must be history - 1 + rollout_steps'
@@ -197,7 +296,11 @@ def main():
 
     model = JEPA(mc).to(device)
     print(f'[model] {sum(p.numel() for p in model.parameters()):,} params, history={hist}, '
-          f'action_context_dim={model.action_context_dim}, device={device}')
+          f'action_context_dim={model.action_context_dim}, predictor={model.predictor_type}, device={device}')
+    if model.graph_spec is not None:
+        from models.jepa.graph import describe
+        print(f'[graph] slots {dict(zip(model.graph_spec["names"], model.graph_spec["sizes"]))}, '
+              f'edges={model.graph_spec["edges"]}\n' + describe(model.graph_spec))
     cfg = loss_cfg(tc)
     recal = needs_bn_recal(args.data)
     if recal:
@@ -237,11 +340,12 @@ def main():
     else:
         torch.save(ckpt(0, float('nan')), out / 'checkpoints' / 'checkpoint_epoch0000.pt')
 
-    names = ['loss', 'rollout', 'fwd', 'inv', 'sig']
+    names = LOSS_NAMES
+    wall = float(history[-1].get('wall_s', 0.)) if history else 0.
     for epoch in range(start, epochs + 1):
         t0 = time.time()
         model.train()
-        tot, n = torch.zeros(5, device=device), 0
+        tot, n = torch.zeros(len(names), device=device), 0
         for batch in loaders['train']:
             loss, parts, _ = losses(model, batch, device, cfg)
             opt.zero_grad(set_to_none=True)
@@ -251,12 +355,17 @@ def main():
             b = batch['obs_seq'].shape[0]
             tot += b * parts; n += b
         train = (tot / n).cpu().numpy()
+        if device.type == 'cuda':
+            torch.cuda.synchronize()
+        train_s = time.time() - t0            # optimisation time only (what "efficiency" compares)
+        wall += train_s
         probe = epoch % int(tc.get('probe_every', 10)) == 0 or epoch == 1
         if recal:
             recalibrate_bn(model, loaders['train'].dataset, device, cfg, int(tc['batch_size']))
         val, zv, yv = run_eval(model, loaders['val'], device, cfg, collect=probe)
         row = {'epoch': epoch, 'lr': float(opt.param_groups[0]['lr']),
-               'train': dict(zip(names, map(float, train))), 'val': dict(zip(names, map(float, val)))}
+               'train': dict(zip(names, map(float, train))), 'val': dict(zip(names, map(float, val))),
+               'train_s': train_s, 'wall_s': wall}
         if recal:
             row['bn_recal'] = True
         msg = (f'[epoch {epoch:3d}/{epochs}] ' + ' '.join(f'{k}={v:.4f}' for k, v in row['train'].items())
@@ -266,6 +375,10 @@ def main():
             r2 = ridge_r2(zt, yt, zv, yv)
             row['probe_r2_x_xdot_theta_thetadot'] = r2.tolist()
             msg += ' | R2=[' + ','.join(f'{v:.3f}' for v in r2) + ']'
+            diag = graph_diagnostic(model, loaders['val'], device, cfg)
+            if diag is not None:
+                row['graph_sensitivity_val'] = diag
+                msg += f' | sens non/par={diag["nonparent_mean"]:.2e}/{diag["parent_mean"]:.2e}'
         print(msg + f' | {time.time() - t0:.0f}s', flush=True)
         history.append(row)
         if val[0] < best:

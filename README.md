@@ -20,6 +20,7 @@ A world model is trained on rendered frames only (no state input). We read a cau
 | Counterfactual queries (JEPA, epoch 200; `docs/counterfactual_study.md`) | done | done |
 | Interchange interventions | **to do** | **to do** |
 | Graph prior during training (masked attention, Jacobian penalty; see below) | code written, **not run** | — |
+| Graph prior: per-output parent masks + dense control (see below) | code written, **not run** | — |
 
 ## Method in one paragraph
 
@@ -206,6 +207,41 @@ foreach ($r in "jepa_cc_phys_e100", "jepa_cc_phys_gmask_e100", "jepa_cc_phys_gja
 ```
 
 Outputs: `results/studies/graph_prior_training/` (`training.png`, `probe_r2.png`, `rollout.png`, `graph.png`, `summary.md`, `summary.json`). Each `history.json` row now also has `train_s` and `wall_s`. Slot-layout runs also log `graph_sensitivity_val` on probe epochs. Optional second seed: rerun the baseline and the better arm with `--seed 43` into new run dirs.
+
+#### Per-output parent masks (report route 2)
+
+This arm has its own package, `models/jepa_peroutput/`, and its configs are in `configs/models/graph_priors/`. Plan and caveats: `docs/graph_priors/peroutput_plan.md`. Each slot of z gets its own MLP. The MLP predicts the slot's **change** and sees only the slots that are parents of that change in the expert graph, at every lag, plus ctx and the current action context. The slot's own value is then added back.
+
+The slot's own value is integration, not a causal edge. So the x and v̄ networks do not see their own slot, because x→Δx and v̄→Δv̄ are absent from the graph.
+
+The **dense control** (`graph_edges: full`) uses the same networks with every input allowed. It separates the effect of the graph from the effect of the architecture. `per_output_hidden: auto` matches the standard predictor's parameter count. Actions are masked per output too; on Acrobot the distractor has no action parent.
+
+Every caveat from the report has a fix or a measurement. The full table is in `docs/graph_priors/peroutput_plan.md`.
+
+| Problem | Fix |
+|---|---|
+| Slots may not hold their variables | `evaluate/slot_selectivity.py` measures it; optional anchoring on all episodes or 5% of them (`_anchor`, `_anchor05`) |
+| ctx could carry state | ctx stability loss, running-mean ctx input (`ctx_pool`), measured by `slot_selectivity.py` |
+| Architecture vs graph | Dense control, parameter-matched |
+| Wrong graph | Shuffled graph, 2 true edges deleted, 2 absent edges added (`graph_corrupt`) |
+| Cart-pole is dense (likely null) | 25% data (`datagen/subset.py`), held-out physics (`datagen/make_ood.py`), 20-step rollouts, Acrobot configs |
+| One seed | Seeds 42–44, compared by seed with `evaluate/compare_seeds.py` |
+| Guessed loss weights | `evaluate/pick_lambda.py`: largest weight within 5% of the standard run's val loss at epoch 10 |
+
+The whole study, with resume after crashes and every evaluation, is one script:
+
+```powershell
+& $PY -m checks.verify_peroutput                         # CPU, no data: masks, invariance, sizes, controls, loader hook
+& $PY -m models.jepa_peroutput.train --data datasets/cc_small --config configs/models/graph_priors/jepa_cartpole_peroutput.yaml --save-dir runs/_smoke/jepa_peroutput --epochs 1
+.\tools\run_graph_prior_study.ps1                        # sweep, main, seeds, controls, anchor, lowdata, ood, acrobot, analysis
+.\tools\run_graph_prior_study.ps1 -Stages main,analysis  # or selected stages
+```
+
+A single run by hand: `& $PY -m models.jepa_peroutput.train --data datasets/cc_phys --config configs/models/graph_priors/jepa_cartpole_peroutput.yaml --save-dir runs/jepa_cc_phys_peroutput_e100 --set training.lambda_ctx=0.1`. `--set` overrides any config key, e.g. `model.graph_corrupt={drop: 2, seed: 0}`.
+
+Outputs are in `results/studies/graph_prior_training/`, with one folder per comparison: `main`, `main_ood`, `controls`, `anchor`, `lowdata`, `lowdata_ood`, `acrobot`, `acrobot_ood`, `seeds`, `selectivity`, `selectivity_acrobot`. Acrobot runs are compared with `compare_seeds`, because `compare_training` assumes cart-pole's 4 state columns.
+
+Checkpoints of this arm store `model_class`. `probing/extract_jepa.load_model` reads that key, so `run_all.py`, the curve, the counterfactual study and `compare_training` load these runs without changes. Older checkpoints have no `model_class` and load as JEPA, as before.
 
 ### Cart-pole, fixed physics (first model)
 

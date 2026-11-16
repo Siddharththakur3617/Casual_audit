@@ -1,0 +1,10 @@
+# Held-out physics for Acrobot (datagen/make_ood.py). Training ranges: configs/envs/acrobot.yaml.
+# Link masses and gravity are drawn ABOVE the training ranges; link lengths stay inside [0.5, 1.5],
+# so the images look like training images while the dynamics are new.
+physics_ranges:
+  m1: [2.0, 3.0]     # training [0.5, 2.0]
+  m2: [2.0, 3.0]     # training [0.5, 2.0]
+  g: [14.7, 17.2]    # training [4.9, 14.7]
+physics_seed: 9090
+data_seed: 9191
+episode_fraction: 0.2

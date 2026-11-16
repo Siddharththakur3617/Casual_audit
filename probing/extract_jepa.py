@@ -21,20 +21,34 @@ from models.jepa import train as jepa_train
 from models.jepa.model import JEPA
 
 
+def model_class(ck):
+    """Model class of a JEPA-type checkpoint: `model_class` ("module:Class", e.g. the per-output arm
+    models.jepa_peroutput.model:JEPAPerOutput), or JEPA when the key is missing (all older runs)."""
+    name = ck.get('model_class')
+    if not name:
+        return JEPA
+    import importlib
+    mod, cls = name.split(':')
+    return getattr(importlib.import_module(mod), cls)
+
+
 def load_model(ckpt_path, device, data_dir=None):
     """Model in eval mode. For environments that need it (models/jepa/train.needs_bn_recal), the BatchNorm
     running statistics are recomputed on the dataset's training windows first, whatever the
-    checkpoint stored, so every checkpoint (epoch 0 included) is read the same way."""
+    checkpoint stored, so every checkpoint (epoch 0 included) is read the same way. Checkpoints with
+    `train_module` recalibrate with that module's losses (recalibrate_bn, loss_cfg)."""
     ck = torch.load(ckpt_path, map_location=device, weights_only=False)
-    model = JEPA(dict(ck['model_config'])).to(device)
+    model = model_class(ck)(dict(ck['model_config'])).to(device)
     model.load_state_dict(ck['model'])
     action_scale = float(ck.get('action_scale', 10.0))
     if data_dir is not None and jepa_train.needs_bn_recal(data_dir):
+        import importlib
         from datagen.windows import WindowDataset
+        tr = importlib.import_module(ck['train_module']) if ck.get('train_module') else jepa_train
         tc = ck['training_config']
         ds = WindowDataset(Path(data_dir) / 'train.hdf5', int(tc['horizon']),
                            int(ck['model_config']['action_context_dim']), action_scale)
-        jepa_train.recalibrate_bn(model, ds, device, jepa_train.loss_cfg(tc), int(tc['batch_size']))
+        tr.recalibrate_bn(model, ds, device, tr.loss_cfg(tc), int(tc['batch_size']))
         del ds
         print(f'  [bn] recalibrated BatchNorm statistics ({jepa_train.BN_RECAL_BATCHES} train batches)')
     model.eval()

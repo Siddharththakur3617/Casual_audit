@@ -1,0 +1,10 @@
+# Held-out physics for cart-pole (datagen/make_ood.py). Training ranges: configs/envs/cartpole.yaml.
+# Masses and gravity are drawn ABOVE the training ranges; the pole half-length l stays inside its
+# training range [0.25, 0.75], so the images look like training images while the dynamics are new.
+physics_ranges:
+  M: [2.0, 3.0]      # training [0.5, 2.0]
+  m: [0.5, 0.75]     # training [0.05, 0.5]
+  g: [14.7, 17.2]    # training [4.9, 14.7]
+physics_seed: 9090   # separate from the training draws (4242)
+data_seed: 9191      # new initial states and actions (training: 42)
+episode_fraction: 0.2   # 20% of the training episode counts per type

@@ -1,0 +1,63 @@
+# JEPA on cart-pole, graph-prior arm P: per-output masks with a shuffled graph (same edge count; wrong-graph control).
+# Same as configs/models/jepa_cartpole.yaml except the per-output block below, lambda_ctx, lambda_anchor,
+# 100 epochs and probing every 5. The transformer predictor_* keys are unused by this arm
+# (they size the parameter target for per_output_hidden: auto).
+# Used by: python -m models.jepa_peroutput.train --config configs/models/graph_priors/jepa_cartpole_peroutput_shuffled.yaml
+
+model:
+  action_context_dim: 2      # [u_{t-1}, u_t]
+  use_action_history: true
+  history_size: 5            # predictor sees z_{t-4..t}
+  image_size: 128
+  patch_size: 8
+  latent_dim: 192
+  use_frame_diff: true
+  use_proprio: false         # pixels only
+  vit_depth: 4
+  vit_embed_dim: 192
+  vit_heads: 3
+  predictor_depth: 6
+  predictor_dim_head: 64
+  predictor_dropout: 0.1
+  predictor_heads: 16
+  predictor_hidden_dim: 192
+  predictor_mlp_dim: 2048
+  use_inverse_model: true
+  inverse_hidden_dim: 256
+  inverse_seq_len: 4         # last history latent + 3 rollout latents
+  # per-output parent masks (models/jepa_peroutput/). Resolved masks are saved in each checkpoint.
+  slot_names: [x, vbar, theta, wbar, ctx]
+  slot_sizes: [40, 40, 40, 40, 32]
+  graph_source: hand         # hand = checks/expert_graph.py; measured = results/expert_graphs/expert_graph_final_<data>.json
+  graph_edges: shuffled      # strong_weak | strong | full (dense control) | shuffled
+  graph_corrupt: null        # e.g. {drop: 2, seed: 0} or {add: 2, seed: 0}: wrong-graph controls
+  per_output_hidden: auto    # width matched to the transformer predictor's parameter count
+  per_output_depth: 3
+  ctx_pool: true             # ctx enters every network as its running mean over the window
+  slot_anchor_heads: false
+
+training:
+  history: 5                 # encoded latents given to the predictor
+  rollout_steps: 3
+  horizon: 7                 # loader window in transitions = history - 1 + rollout_steps
+  batch_size: 64
+  epochs: 100
+  lr: 0.0001
+  min_lr: 1.0e-06
+  warmup_epochs: 5
+  weight_decay: 0.001
+  normalize_actions: true
+  lambda_fwd: 0.0
+  lambda_inverse: 1.0
+  lambda_rollout: 1.0
+  lambda_sigreg: 1.0
+  sigreg_num_points: 17
+  sigreg_num_slices: 128
+  sigreg_variance_floor_weight: 0.0
+  lambda_ctx: 0.1            # ctx slot constant within a window; pick with evaluate.pick_lambda
+  lambda_anchor: 0.0         # > 0 uses true-state labels (no longer pixels-only)
+  anchor_fraction: 1.0       # fraction of training EPISODES whose labels are used
+  anchor_seed: 0
+  num_workers: 0
+  checkpoint_every: 10
+  probe_every: 5

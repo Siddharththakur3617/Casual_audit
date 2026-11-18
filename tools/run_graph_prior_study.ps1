@@ -1,4 +1,4 @@
-# Graph-prior study, end to end: every arm, every control, every evaluation. Run from the project root:
+﻿# Graph-prior study, end to end: every arm, every control, every evaluation. Run from the project root:
 #   .\tools\run_graph_prior_study.ps1                          # all stages, in order
 #   .\tools\run_graph_prior_study.ps1 -Stages sweep,main       # selected stages
 #   .\tools\run_graph_prior_study.ps1 -Stages analysis         # only the evaluations (after training)
@@ -34,6 +34,18 @@ function Run-Py([string]$Log, [string[]]$PyArgs) {
     # Out-Host keeps the console output out of the function's return value (only the exit code is returned)
     & $py -u @PyArgs 2>&1 | ForEach-Object { "$_" } | Tee-Object -FilePath $Log -Append | Out-Host
     return $LASTEXITCODE
+}
+
+function Run-Retry([string]$Log, [string[]]$PyArgs) {
+    # for resumable analysis steps: python has crashed natively here (0xc0000005), so rerun until it exits cleanly
+    for ($try = 1; $try -le $MaxRestarts; $try++) {
+        $code = Run-Py $Log $PyArgs
+        if ($code -eq 0) { return 0 }
+        Write-Host "[retry] exited with code $code (attempt $try of $MaxRestarts), retrying in 20 s"
+        Start-Sleep -Seconds 20
+    }
+    Write-Host "[retry] gave up after $MaxRestarts attempts: $($PyArgs -join ' ')"
+    return $code
 }
 
 function Invoke-Train([string]$Module, [string]$D, [string]$Config, [string]$SaveDir, [int]$E,
@@ -169,16 +181,16 @@ if (Has 'analysis') {
         if ($p.Count -lt 2) { Write-Host "[skip] ${Out}: fewer than 2 finished runs"; return }
         $a = @('-m', 'evaluate.compare_training', '--data', $D, '--out', $Out, '--runs') + @($p | ForEach-Object { ($_ -split '=', 2)[1] }) +
              @('--labels') + @($p | ForEach-Object { ($_ -split '=', 2)[0] })
-        Run-Py $L $a | Out-Null
+        Run-Retry $L $a | Out-Null
     }
 
     # graph-recovery curves (low-data runs are scored on the full dataset, which has the expert graph and null)
-    Run-Py $L @('-m', 'discovery.null_calibration', '--data', $AcData, '--reps', '20', '--splits', '20') | Out-Null
+    Run-Retry $L @('-m', 'discovery.null_calibration', '--data', $AcData, '--reps', '20', '--splits', '20') | Out-Null
     foreach ($pair in (Existing ($main + $ctrl + $anch + $low))) {
-        Run-Py $L @('run_all.py', '--data', $Data, '--run-dir', ($pair -split '=', 2)[1], '--curve', '--splits', '20', '--prune', 'null_cal_fwer') | Out-Null
+        Run-Retry $L @('run_all.py', '--data', $Data, '--run-dir', ($pair -split '=', 2)[1], '--curve', '--splits', '20', '--prune', 'null_cal_fwer') | Out-Null
     }
     foreach ($pair in (Existing $acro)) {
-        Run-Py $L @('run_all.py', '--data', $AcData, '--run-dir', ($pair -split '=', 2)[1], '--curve', '--splits', '20', '--prune', 'null_cal_fwer') | Out-Null
+        Run-Retry $L @('run_all.py', '--data', $AcData, '--run-dir', ($pair -split '=', 2)[1], '--curve', '--splits', '20', '--prune', 'null_cal_fwer') | Out-Null
     }
 
     # training comparisons (in distribution, held-out physics, low data, Acrobot)
@@ -192,9 +204,9 @@ if (Has 'analysis') {
     $acroOk = Existing $acro
     if ($acroOk.Count -ge 2) {
         $g = @(); foreach ($pair in $acroOk) { $g += @('--group', $pair) }
-        Run-Py $L (@('-m', 'evaluate.compare_seeds', '--data', $AcData, '--out', "$S/acrobot") + $g) | Out-Null
+        Run-Retry $L (@('-m', 'evaluate.compare_seeds', '--data', $AcData, '--out', "$S/acrobot") + $g) | Out-Null
         if (Test-Path "${AcData}_ood/val.hdf5") {
-            Run-Py $L (@('-m', 'evaluate.compare_seeds', '--data', "${AcData}_ood", '--out', "$S/acrobot_ood") + $g) | Out-Null
+            Run-Retry $L (@('-m', 'evaluate.compare_seeds', '--data', "${AcData}_ood", '--out', "$S/acrobot_ood") + $g) | Out-Null
         }
     }
 
@@ -206,17 +218,17 @@ if (Has 'analysis') {
         $runs = @($runs | Where-Object { Test-Path (Join-Path $_ 'history.json') })
         if ($runs.Count -ge 2) { $groups += @('--group', "$lab=" + ($runs -join ',')) }
     }
-    if ($groups.Count -ge 4) { Run-Py $L (@('-m', 'evaluate.compare_seeds', '--data', $Data, '--out', "$S/seeds") + $groups) | Out-Null }
+    if ($groups.Count -ge 4) { Run-Retry $L (@('-m', 'evaluate.compare_seeds', '--data', $Data, '--out', "$S/seeds") + $groups) | Out-Null }
 
     # do the slots hold their variables, and does ctx hold physics? (unseen episodes)
     $sel = Existing ($main + $ctrl[1..3] + $anch[2..3])
     if ($sel.Count -gt 0) {
-        Run-Py $L (@('-m', 'evaluate.slot_selectivity', '--data', $Data, '--split', 'val', '--out', "$S/selectivity", '--runs') +
+        Run-Retry $L (@('-m', 'evaluate.slot_selectivity', '--data', $Data, '--split', 'val', '--out', "$S/selectivity", '--runs') +
                    @($sel | ForEach-Object { ($_ -split '=', 2)[1] }) + @('--labels') + @($sel | ForEach-Object { ($_ -split '=', 2)[0] })) | Out-Null
     }
     $selA = Existing $acro
     if ($selA.Count -gt 0) {
-        Run-Py $L (@('-m', 'evaluate.slot_selectivity', '--data', $AcData, '--split', 'val', '--out', "$S/selectivity_acrobot", '--runs') +
+        Run-Retry $L (@('-m', 'evaluate.slot_selectivity', '--data', $AcData, '--split', 'val', '--out', "$S/selectivity_acrobot", '--runs') +
                    @($selA | ForEach-Object { ($_ -split '=', 2)[1] }) + @('--labels') + @($selA | ForEach-Object { ($_ -split '=', 2)[0] })) | Out-Null
     }
     Write-Host "[analysis] outputs in $S"

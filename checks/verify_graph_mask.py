@@ -51,6 +51,12 @@ def main():
             for k, f in (('base', 'jepa_cartpole.yaml'), ('mask', 'jepa_cartpole_graphmask.yaml'),
                          ('jac', 'jepa_cartpole_graphjac.yaml'))}
     models = {k: JEPA(c).eval() for k, c in cfgs.items()}
+    # AdaLN-zero blocks start with every gate at exactly 0, which switches attention and the MLP off:
+    # a fresh model then has no cross-slot influence at all, so "allowed" edges would fail and "masked"
+    # edges would pass vacuously. Give the gates random values so the attention path is really tested.
+    for mdl in models.values():
+        for blk in mdl.predictor.blocks:
+            torch.nn.init.normal_(blk.adaln[-1].weight, std=0.05)
     b, T, d = 8, models['mask'].history_size, 192
     zh = torch.randn(b, T, d)
     ah = torch.randn(b, T, models['mask'].action_context_dim)

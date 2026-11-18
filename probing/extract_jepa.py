@@ -10,6 +10,7 @@ plus the true variables from env.episode_variables (same t's).
 """
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 import h5py
@@ -153,5 +154,9 @@ def extract(ckpt_path, data_dir, split='train', device='cuda', out=None):
     res['epoch'] = np.int64(epoch)
     if out is not None:
         Path(out).parent.mkdir(parents=True, exist_ok=True)
-        np.savez_compressed(out, **res)
+        # Uncompressed: zlib compression of the cache crashed python (0xc0000005) on this unstable CPU.
+        # Write-then-rename so a crash never leaves a truncated cache that looks finished.
+        tmp = Path(out).with_name(Path(out).stem + '.partial.npz')
+        np.savez(tmp, **res)
+        os.replace(tmp, out)
     return res
